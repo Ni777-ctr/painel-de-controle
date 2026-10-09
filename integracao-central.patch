@@ -1,0 +1,1250 @@
+--- a/app/config.py
++++ b/app/config.py
+@@ -31,6 +31,8 @@
+     ALLOWED_HOSTS: str = ""
+     # Esconde /docs, /redoc e /openapi.json (recomendado em producao).
+     DOCS_HABILITADO: bool = True
++    # IDs autorizados ao painel local; não altera os hosts/CORS do site principal.
++    CENTRAL_ADMIN_IDS: str = ''
+     # Exige 2FA para os perfis em PERFIS_COM_2FA_OBRIGATORIO (app/security.py).
+     MFA_OBRIGATORIO_ENFORCE: bool = False
+     # Limite de tentativas de login por IP (janela deslizante, em memoria do processo).
+--- a/app/deps.py
++++ b/app/deps.py
+@@ -33,6 +33,12 @@
+     usuario = db.query(Usuario).filter(Usuario.usuario == payload["sub"]).first()
+     if not usuario or not usuario.ativo:
+         raise credenciais_invalidas
++    from app.central.policy import installed, epoch
++    from app.central.models import ContaCentral
++    if installed(db):
++        conta = db.get(ContaCentral, usuario.id)
++        if payload.get('central_versao', 0) != epoch(db, usuario.id) or (conta and conta.estado != 'ativo'):
++            raise credenciais_invalidas
+     return usuario
+ 
+ 
+@@ -56,6 +62,12 @@
+     """Checagem pontual de permissao (fora do padrao Depends), usada quando a
+     permissao necessaria so e conhecida em tempo de execucao -- ex.: qual
+     transicao de status especifica esta sendo tentada."""
++    from sqlalchemy.orm import object_session
++    from app.central.policy import installed, central_admin
++    from app.central.models import ContaCentral
++    db = object_session(usuario)
++    if db is not None and installed(db) and db.get(ContaCentral, usuario.id) and not central_admin(usuario):
++        return False  # busca global também não pode vazar o escopo de setores
+     permissoes = set(usuario.perfil.permissoes or [])
+     return "*" in permissoes or chave in permissoes
+ 
+@@ -65,6 +77,8 @@
+     nenhuma das permissoes informadas (nem o coringa "*")."""
+ 
+     def checador(usuario: Usuario = Depends(get_current_user), db: Session = Depends(get_db)) -> Usuario:
++        from app.central.policy import legacy_guard
++        legacy_guard(db, usuario, permissoes_necessarias)
+         permissoes_usuario = set(usuario.perfil.permissoes or [])
+         if "*" in permissoes_usuario:
+             return usuario
+--- a/app/main.py
++++ b/app/main.py
+@@ -56,6 +56,11 @@
+     openapi_url="/openapi.json" if settings.DOCS_HABILITADO else None,
+ )
+ 
++# API compartilhada; a interface central é servida por app.central.main:app,
++# em outro processo, exclusivamente local.
++from app.central.delegacao import router as governanca_router
++app.include_router(governanca_router)
++
+ # Ordem: o ultimo add_middleware e' o mais externo.
+ app.add_middleware(
+     CORSMiddleware,
+--- a/app/routers/auth.py
++++ b/app/routers/auth.py
+@@ -49,6 +49,26 @@
+ settings = get_settings()
+ 
+ 
++def _central_lock(db: Session):
++    from app.central.policy import installed
++    if installed(db) and db.get_bind().dialect.name == 'postgresql':
++        from sqlalchemy import text
++        db.execute(text('SELECT pg_advisory_xact_lock(7349102301)'))
++
++
++def _central_claims(db: Session, usuario: Usuario, tipo: str):
++    from app.central.policy import installed, epoch
++    claims = {'tipo': tipo}
++    if installed(db):
++        claims['central_versao'] = epoch(db, usuario.id)
++    return claims
++
++
++def _central_temporario_valido(db: Session, usuario: Usuario, payload: dict):
++    from app.central.policy import installed, epoch
++    return not installed(db) or payload.get('central_versao', 0) == epoch(db, usuario.id)
++
++
+ def _agora() -> datetime:
+     return datetime.now(timezone.utc)
+ 
+@@ -76,7 +96,12 @@
+ 
+ 
+ def _gerar_par_tokens(db: Session, usuario: Usuario) -> dict:
+-    access_token = criar_access_token(subject=usuario.usuario, extra_claims={"perfil_id": usuario.perfil_id})
++    claims = {"perfil_id": usuario.perfil_id}
++    from app.central.policy import installed, epoch
++    from app.central.models import ContaCentral
++    if installed(db):
++        claims['central_versao'] = epoch(db, usuario.id)
++    access_token = criar_access_token(subject=usuario.usuario, extra_claims=claims)
+ 
+     refresh_bruto = gerar_token_opaco()
+     db.add(
+@@ -116,6 +141,12 @@
+     """Chamado quando a senha (ou a troca de senha obrigatoria, ou o convite)
+     acabou de ser validada com sucesso. Decide entre exigir 2FA ou emitir os
+     tokens finais direto."""
++    from app.central.policy import installed
++    from app.central.models import ContaCentral
++    if installed(db):
++        conta = db.get(ContaCentral, usuario.id)
++        if conta and conta.estado != 'ativo':
++            raise HTTPException(403, 'Conta bloqueada, desativada ou com convite pendente.')
+     if (
+         not usuario.mfa_habilitado
+         and settings.MFA_OBRIGATORIO_ENFORCE
+@@ -124,12 +155,12 @@
+         # Perfil sensivel sem 2FA: nao emite sessao; so um token restrito para configurar o 2FA.
+         registrar(db, usuario_id=usuario.id, acao="login_bloqueado_mfa_obrigatorio", entidade="usuarios", entidade_id=str(usuario.id))
+         db.commit()
+-        setup_token = criar_token_temporario(usuario.usuario, 15, {"tipo": "mfa_setup"})
++        setup_token = criar_token_temporario(usuario.usuario, 15, _central_claims(db, usuario, 'mfa_setup'))
+         return LoginResponse(mfa_configuracao_pendente=True, mfa_setup_token=setup_token)
+ 
+     if usuario.mfa_habilitado:
+         mfa_token = criar_token_temporario(
+-            usuario.usuario, settings.MFA_TOKEN_EXPIRE_MINUTOS, {"tipo": "mfa_pendente"}
++            usuario.usuario, settings.MFA_TOKEN_EXPIRE_MINUTOS, _central_claims(db, usuario, 'mfa_pendente')
+         )
+         registrar(db, usuario_id=usuario.id, acao="login_senha_ok_aguardando_mfa", entidade="usuarios", entidade_id=str(usuario.id))
+         db.commit()
+@@ -145,6 +176,7 @@
+ 
+ @router.post("/login", response_model=LoginResponse)
+ def login(dados: LoginRequest, db: Session = Depends(get_db)):
++    _central_lock(db)
+     ip = obter_contexto().ip or "desconhecido"
+     if limitador_login.excedeu(ip, settings.LOGIN_RATE_LIMIT_MAX, settings.LOGIN_RATE_LIMIT_JANELA_SEGUNDOS):
+         registrar(db, usuario_id=None, acao="login_rate_limit", entidade="usuarios", depois={"usuario_tentado": dados.usuario[:60]})
+@@ -240,7 +272,7 @@
+ 
+     if motivo_troca:
+         senha_pendente_token = criar_token_temporario(
+-            usuario.usuario, settings.SENHA_PENDENTE_TOKEN_EXPIRE_MINUTOS, {"tipo": "senha_pendente"}
++            usuario.usuario, settings.SENHA_PENDENTE_TOKEN_EXPIRE_MINUTOS, _central_claims(db, usuario, 'senha_pendente')
+         )
+         registrar(
+             db,
+@@ -261,13 +293,14 @@
+     """Completa a troca de senha exigida (primeiro acesso com senha temporaria
+     ou expiracao pela regra dos 6 meses) e, na sequencia, finaliza o login
+     (emite tokens, ou pede 2FA se o usuario tiver habilitado)."""
++    _central_lock(db)
+     payload = decodificar_token(dados.senha_pendente_token)
+     invalido = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalido ou expirado.")
+     if not payload or payload.get("tipo") != "senha_pendente" or "sub" not in payload:
+         raise invalido
+ 
+     usuario = db.query(Usuario).filter(Usuario.usuario == payload["sub"]).first()
+-    if not usuario or not usuario.ativo:
++    if not usuario or not usuario.ativo or not _central_temporario_valido(db, usuario, payload):
+         raise invalido
+ 
+     agora = _agora()
+@@ -297,13 +330,14 @@
+ 
+ @router.post("/mfa/validar", response_model=TokenResponse)
+ def validar_mfa(dados: MfaValidarRequest, db: Session = Depends(get_db)):
++    _central_lock(db)
+     payload = decodificar_token(dados.mfa_token)
+     invalido = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="mfa_token invalido ou expirado.")
+     if not payload or payload.get("tipo") != "mfa_pendente" or "sub" not in payload:
+         raise invalido
+ 
+     usuario = db.query(Usuario).filter(Usuario.usuario == payload["sub"]).first()
+-    if not usuario or not usuario.ativo or not usuario.mfa_habilitado:
++    if not usuario or not usuario.ativo or not usuario.mfa_habilitado or not _central_temporario_valido(db, usuario, payload):
+         raise invalido
+ 
+     if not verificar_codigo_totp(usuario.mfa_secret, dados.codigo):
+@@ -321,6 +355,7 @@
+ 
+ @router.post("/refresh", response_model=TokenResponse)
+ def refresh(dados: RefreshRequest, db: Session = Depends(get_db)):
++    _central_lock(db)
+     token_hash = hash_token_opaco(dados.refresh_token)
+     registro = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+ 
+@@ -333,6 +368,12 @@
+         raise invalido
+ 
+     # Rotaciona: revoga o token usado e emite um par novo.
++    from app.central.policy import installed
++    from app.central.models import ContaCentral
++    if installed(db):
++        conta = db.get(ContaCentral, usuario.id)
++        if conta and conta.estado != 'ativo':
++            raise invalido
+     registro.revogado = True
+     tokens = _gerar_par_tokens(db, usuario)
+     db.commit()
+@@ -389,6 +430,7 @@
+ 
+ @router.post("/definir-senha", response_model=UsuarioOut)
+ def definir_senha_por_convite(dados: DefinirSenhaConvite, db: Session = Depends(get_db)):
++    _central_lock(db)
+     token_hash = hash_token_opaco(dados.convite_token)
+     usuario = db.query(Usuario).filter(Usuario.convite_token_hash == token_hash).first()
+ 
+@@ -399,6 +441,21 @@
+         raise invalido
+ 
+     usuario.senha_hash = hash_senha(dados.senha)
++    from app.central.policy import installed, mutation, check_limit
++    from app.central.models import ContaCentral, Vinculo
++    if installed(db):
++        conta = db.get(ContaCentral, usuario.id)
++        if conta:
++            if not usuario.ativo or conta.estado != 'pendente':
++                raise invalido
++            # A ativação disputa o mesmo lock dos cadastros e reativações.
++            if db.get_bind().dialect.name == 'postgresql':
++                from sqlalchemy import text
++                db.execute(text('SELECT pg_advisory_xact_lock(7349102301)'))
++            check_limit(db, conta.cargo, exclude=usuario.id)
++            for vinculo in db.query(Vinculo).filter_by(usuario_id=usuario.id):
++                check_limit(db, vinculo.cargo, vinculo.setor_id, exclude=usuario.id)
++            conta.estado = 'ativo'
+     usuario.senha_definida = True
+     usuario.senha_alterada_em = _agora()
+     usuario.convite_token_hash = None
+--- a/scripts/anonimizar_homologacao.py
++++ b/scripts/anonimizar_homologacao.py
+@@ -29,11 +29,12 @@
+ import sys
+ from typing import Any, Callable
+ 
+-from sqlalchemy import JSON, MetaData, String, Text, bindparam, create_engine, delete, insert, select, update
++from sqlalchemy import JSON, MetaData, String, Text, bindparam, create_engine, delete, insert, select, update, inspect
+ from sqlalchemy.engine import Engine
+ 
+ from app.database import Base
+ import app.models  # noqa: F401 -- registra os modelos em Base.metadata
++import app.central.models  # noqa: F401 -- esquema central opcional
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -125,6 +126,7 @@
+ 
+ # tabela -> {coluna: estrategia}. PK padrao = "id" (excecoes em PK_ESPECIAL).
+ ESTRATEGIAS: dict[str, dict[str, Estrategia]] = {
++    'central_setores': {'nome': por_id('Setor'), 'descricao': texto_removido},
+     "usuarios": {
+         "nome": por_id("Usuario"), "usuario": lambda pk, v, c: f"anon-user-{pk}", "email": email_fake("user"),
+         "senha_hash": lambda pk, v, c: c.senha_hash_inutilizavel, "convite_token_hash": nulo,
+@@ -170,10 +172,18 @@
+ }
+ PK_ESPECIAL = {"parametros_globais": "chave"}
+ # Tabelas cujas linhas sao apagadas por inteiro (credenciais de sessao).
+-APAGAR_TABELAS = ("refresh_tokens",)
++APAGAR_TABELAS = ("refresh_tokens", 'central_sessoes')
+ 
+ # Colunas de texto/JSON mantidas de proposito (codigos de negocio, status, enums, dados tecnicos).
+ PRESERVADAS: dict[str, set[str]] = {
++    'central_contas': {'cargo', 'estado'},
++    'central_vinculos': {'cargo'},
++    'central_setores': {'modulos', 'cargos'},
++    'central_limites': {'cargo'},
++    'central_regras': {'cargo', 'permissao'},
++    'central_excecoes': {'permissao'},
++    # Estas linhas são apagadas integralmente na cópia de homologação.
++    'central_sessoes': {'token_hash', 'csrf'},
+     "alertas_financeiros": {"tipo", "nivel"},
+     "almoxarifados": {"nome", "regional"},
+     "audit_logs": {"bot", "acao", "categoria", "entidade", "entidade_id"},
+@@ -257,11 +267,11 @@
+         trans = con.begin()
+         try:
+             for nome_tabela in APAGAR_TABELAS:
+-                if nome_tabela in metadata.tables:
++                if nome_tabela in metadata.tables and inspect(con).has_table(nome_tabela):
+                     r = con.execute(delete(metadata.tables[nome_tabela]))
+                     resumo[nome_tabela] = r.rowcount or 0
+             for nome_tabela, cols in ESTRATEGIAS.items():
+-                if nome_tabela not in metadata.tables:
++                if nome_tabela not in metadata.tables or not inspect(con).has_table(nome_tabela):
+                     continue
+                 tabela = metadata.tables[nome_tabela]
+                 pk = tabela.c[PK_ESPECIAL.get(nome_tabela, "id")]
+--- /dev/null
++++ b/alembic/versions/0011_central_local.py
+@@ -0,0 +1,17 @@
++"""Governança central aditiva. Sem seeds, renomes ou alteração de usuários."""
++from alembic import op
++from app.central.models import ContaCentral, Setor, Vinculo, Limite, Regra, Excecao, Sessao, VersaoAutenticacao
++
++revision = '0011_central_local'
++down_revision = '0010'
++branch_labels = None
++depends_on = None
++TABLES = [ContaCentral.__table__, Setor.__table__, Vinculo.__table__, Limite.__table__, Regra.__table__, Excecao.__table__, Sessao.__table__, VersaoAutenticacao.__table__]
++
++def upgrade():
++    for table in TABLES:
++        table.create(op.get_bind(), checkfirst=False)
++
++def downgrade():
++    for table in reversed(TABLES):
++        table.drop(op.get_bind(), checkfirst=False)
+--- /dev/null
++++ b/app/central/__init__.py
+@@ -0,0 +1 @@
++"""Painel local e políticas compartilhadas de governança."""
+--- /dev/null
++++ b/app/central/delegacao.py
+@@ -0,0 +1,57 @@
++"""API compartilhada para convites delegados; não serve o site administrativo."""
++from fastapi import APIRouter, Depends, HTTPException
++from sqlalchemy.orm import Session
++from app.database import get_db
++from app.deps import get_current_user
++from app.models.usuario import Perfil
++from app.central.models import ContaCentral, Vinculo, Limite
++from app.central.policy import central_admin, deny, mutation
++from app.central.main import UserInput, save_user_transaction
++
++router = APIRouter(prefix='/governanca', tags=['Governança'])
++
++@router.post('/convites', status_code=201)
++def invite(data: UserInput, actor=Depends(get_current_user), db: Session = Depends(get_db)):
++    with mutation(db):
++        if not central_admin(actor):
++            account = db.get(ContaCentral, actor.id)
++            hierarchy = {'dono': {'gerente'}, 'gerente': {'coordenador', 'colaborador'}, 'coordenador': {'colaborador'}, 'colaborador': set()}
++            if not account or data.cargo not in hierarchy[account.cargo]:
++                deny(db, actor, 'Seu cargo não pode cadastrar este cargo.')
++            limit = db.get(Limite, (account.cargo, 0))
++            if not limit or not limit.pode_cadastrar:
++                deny(db, actor, 'Delegação de cadastro não habilitada.')
++            profile = db.get(Perfil, data.perfil_id)
++            if not profile or '*' in profile.permissoes or data.perfil_id == 'administrador':
++                deny(db, actor, 'Delegação não pode conceder um perfil privilegiado.')
++            if not data.vinculos:
++                deny(db, actor, 'Cadastro delegado exige um setor autorizado.')
++            for link in data.vinculos:
++                mine = db.query(Vinculo).filter_by(usuario_id=actor.id, setor_id=link.setor_id).first()
++                if not mine or link.cargo != data.cargo or data.cargo not in hierarchy[mine.cargo]:
++                    deny(db, actor, 'Setor ou cargo fora do seu escopo de delegação.')
++                if mine.cargo == 'coordenador' and link.responsavel_id != actor.id:
++                    deny(db, actor, 'Coordenador só cadastra colaboradores de sua responsabilidade.')
++                allowed_parents = {actor.id}
++                # A equipe é calculada no servidor, dentro do mesmo setor.
++                changed = True
++                while changed:
++                    changed = False
++                    for candidate in db.query(Vinculo).filter_by(setor_id=link.setor_id):
++                        if candidate.responsavel_id in allowed_parents and candidate.usuario_id not in allowed_parents:
++                            allowed_parents.add(candidate.usuario_id)
++                            changed = True
++                if link.responsavel_id not in allowed_parents:
++                    deny(db, actor, 'Responsável fora da sua equipe autorizada.')
++        try:
++            return save_user_transaction(db, actor, 0, data)
++        except HTTPException as error:
++            deny(db, actor, str(error.detail))
++
++@router.get('/contextos/{sid}/permissoes')
++def permissions(sid: int, actor=Depends(get_current_user), db: Session = Depends(get_db)):
++    from app.central.main import catalog
++    from app.central.policy import effective
++    if not db.query(Vinculo).filter_by(usuario_id=actor.id, setor_id=sid).first():
++        deny(db, actor, 'Usuário não vinculado ao setor solicitado.')
++    return [{'permissao': k, 'permitido': effective(db, actor, sid, k)[0], 'origem': effective(db, actor, sid, k)[1]} for k in catalog(db)]
+--- /dev/null
++++ b/app/central/main.py
+@@ -0,0 +1,428 @@
++"""Site administrativo separado. Inicie somente em 127.0.0.1."""
++import os
++import re
++import secrets
++import time
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from fastapi import FastAPI, Depends, HTTPException, Request, Response
++from fastapi.responses import FileResponse, JSONResponse
++from fastapi.staticfiles import StaticFiles
++from pydantic import BaseModel, ConfigDict, Field
++from sqlalchemy.orm import Session
++from sqlalchemy.exc import IntegrityError
++from starlette.middleware.trustedhost import TrustedHostMiddleware
++from app.database import get_db
++import app.models
++from app.models.usuario import Usuario, Perfil, RefreshToken
++from app.models.auditoria import AuditLog
++from app.routers import auth
++from app.schemas.auth import LoginRequest, MfaValidarRequest, TrocarSenhaObrigatoriaRequest
++from app.security import gerar_token_opaco, hash_token_opaco, hash_senha
++from app.central.models import *
++from app.central.policy import *
++
++app = FastAPI(title='Nithicom · Central de acessos', docs_url=None, redoc_url=None, openapi_url=None)
++app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1', 'testserver'])
++STATIC = Path(__file__).parent / 'static'
++challenges = {}
++
++def aware(value):
++    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
++
++@app.middleware('http')
++async def local_security(request: Request, call_next):
++    host = request.headers.get('host', '')
++    if host not in {'localhost:8765', '127.0.0.1:8765', 'testserver'}:
++        return JSONResponse({'detail': 'Host não autorizado. Use localhost:8765.'}, 400)
++    if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
++        origin = request.headers.get('origin')
++        expected = f'{request.url.scheme}://{host}'
++        if origin != expected:
++            return JSONResponse({'detail': 'Origem da operação não autorizada.'}, 403)
++    result = await call_next(request)
++    result.headers['Cache-Control'] = 'no-store'
++    result.headers['X-Content-Type-Options'] = 'nosniff'
++    result.headers['X-Frame-Options'] = 'DENY'
++    result.headers['Referrer-Policy'] = 'no-referrer'
++    result.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
++    return result
++
++def authenticated(request: Request, db: Session = Depends(get_db)):
++    token = request.cookies.get('central_session', '')
++    session = db.get(Sessao, hash_token_opaco(token)) if token else None
++    if not session or aware(session.expira_em) <= datetime.now(timezone.utc):
++        raise HTTPException(401, 'Entre com sua conta de administrador central.')
++    user = db.get(Usuario, session.usuario_id)
++    account = db.get(ContaCentral, session.usuario_id)
++    if not user or not central_admin(user) or session.versao != epoch(db, session.usuario_id) or (account and account.estado != 'ativo'):
++        raise HTTPException(401, 'Sessão encerrada ou conta sem acesso.')
++    if user.bloqueado_ate and aware(user.bloqueado_ate) > datetime.now(timezone.utc):
++        raise HTTPException(401, 'Conta bloqueada.')
++    if request.method not in {'GET', 'HEAD'} and not secrets.compare_digest(request.headers.get('x-csrf-token', ''), session.csrf):
++        deny(db, user, 'Confirmação CSRF inválida.')
++    return user
++
++def finish_login(result, response, db):
++    if getattr(result, 'mfa_configuracao_pendente', False):
++        raise HTTPException(409, 'Configure o segundo fator no site principal e retorne ao painel.')
++    if getattr(result, 'mfa_pendente', False) or getattr(result, 'senha_pendente', False):
++        now = time.time()
++        for key in list(challenges):
++            if challenges[key]['expires'] < now:
++                challenges.pop(key, None)
++        challenge_id = secrets.token_urlsafe(32)
++        challenges[challenge_id] = {'expires': now + 300, 'result': result}
++        response.set_cookie('central_challenge', challenge_id, httponly=True, samesite='strict', max_age=300, path='/api/login')
++        return {'etapa': 'mfa' if getattr(result, 'mfa_pendente', False) else 'senha', 'mensagem': 'Informe o código do autenticador.' if getattr(result, 'mfa_pendente', False) else 'Defina uma nova senha para continuar.'}
++    user = db.get(Usuario, result.usuario.id)
++    if not central_admin(user):
++        deny(db, user, 'Acesso exclusivo do administrador central autorizado.')
++    # Os JWTs originais nunca saem para o navegador deste painel.
++    db.query(RefreshToken).filter_by(token_hash=hash_token_opaco(result.refresh_token)).update({'revogado': True})
++    token = gerar_token_opaco()
++    account = db.get(ContaCentral, user.id)
++    session = Sessao(token_hash=hash_token_opaco(token), usuario_id=user.id, csrf=secrets.token_hex(32),
++                    versao=epoch(db, user.id), expira_em=datetime.now(timezone.utc) + timedelta(hours=1))
++    db.add(session)
++    db.commit()
++    response.set_cookie('central_session', token, httponly=True, samesite='strict', max_age=3600, path='/')
++    response.delete_cookie('central_challenge', path='/api/login')
++    return {'etapa': 'concluido', 'csrf': session.csrf, 'nome': user.nome}
++
++@app.post('/api/login')
++def login(data: LoginRequest, response: Response, db: Session = Depends(get_db)):
++    user = db.query(Usuario).filter_by(usuario=data.usuario).first()
++    # Previne que contas comuns obtenham tokens temporários administrativos.
++    if not user or not central_admin(user):
++        from app.security import limitador_login
++        if limitador_login.excedeu('central-login', 20, 60):
++            raise HTTPException(429, 'Muitas tentativas. Aguarde um minuto.')
++        deny(db, user, 'Usuário ou senha inválidos para a central.')
++    result = auth.login(data, db)
++    return finish_login(result, response, db)
++
++class ChallengeInput(BaseModel):
++    codigo: str = Field(default='', max_length=10)
++    nova_senha: str = Field(default='', max_length=72)
++
++@app.post('/api/login/continuar')
++def continue_login(data: ChallengeInput, request: Request, response: Response, db: Session = Depends(get_db)):
++    key = request.cookies.get('central_challenge')
++    challenge = challenges.pop(key, None)
++    if not challenge or challenge['expires'] < time.time():
++        raise HTTPException(401, 'Etapa de autenticação expirada. Entre novamente.')
++    result = challenge['result']
++    if result.mfa_pendente:
++        result = auth.validar_mfa(MfaValidarRequest(mfa_token=result.mfa_token, codigo=data.codigo), db)
++    else:
++        if len(data.nova_senha) < 12:
++            raise HTTPException(422, 'Utilize uma senha com pelo menos 12 caracteres.')
++        result = auth.trocar_senha_obrigatoria(TrocarSenhaObrigatoriaRequest(senha_pendente_token=result.senha_pendente_token, nova_senha=data.nova_senha), db)
++    return finish_login(result, response, db)
++
++@app.get('/api/session')
++def current(request: Request, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    record = db.get(Sessao, hash_token_opaco(request.cookies['central_session']))
++    return {'nome': actor.nome, 'id': actor.id, 'csrf': record.csrf}
++
++@app.post('/api/logout')
++def logout(request: Request, response: Response, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    with mutation(db):
++        db.query(Sessao).filter_by(token_hash=hash_token_opaco(request.cookies['central_session'])).delete()
++        audit(db, actor, 'logout', 'usuarios', actor.id, None, None, 'Saída do painel')
++    response.delete_cookie('central_session')
++    return {'ok': True}
++
++def public_user(db, user):
++    account = db.get(ContaCentral, user.id)
++    state = account.estado if account else ('desativado' if not user.ativo else 'pendente' if not user.senha_definida else 'bloqueado' if user.bloqueado_ate and aware(user.bloqueado_ate) > datetime.now(timezone.utc) else 'ativo')
++    if state == 'ativo' and user.bloqueado_ate and aware(user.bloqueado_ate) > datetime.now(timezone.utc):
++        state = 'bloqueado'
++    if not user.ativo and state not in {'bloqueado', 'desativado'}:
++        state = 'desativado'
++    return {'id': user.id, 'nome': user.nome, 'usuario': user.usuario, 'email': user.email,
++            'perfil_id': user.perfil_id, 'cargo': account.cargo if account else None, 'estado': state,
++            'gerenciado': bool(account), 'criado_por': account.criado_por if account else None,
++            'mfa': user.mfa_habilitado, 'ultimo_login': aware(user.ultimo_login_em).isoformat() if user.ultimo_login_em else None,
++            'vinculos': [{'setor_id': v.setor_id, 'cargo': v.cargo, 'responsavel_id': v.responsavel_id} for v in db.query(Vinculo).filter_by(usuario_id=user.id)]}
++
++def catalog(db):
++    keys = set()
++    for profile in db.query(Perfil):
++        keys.update(p for p in profile.permissoes if p != '*')
++    for path in (Path(__file__).parent.parent / 'routers').glob('*.py'):
++        keys.update(re.findall(r'[\"\']([a-z_]+:[a-z_]+)[\"\']', path.read_text(encoding='utf-8')))
++    return sorted(keys)
++
++def asdict(obj, fields):
++    return {f: aware(getattr(obj, f)).isoformat() if isinstance(getattr(obj, f), datetime) else getattr(obj, f) for f in fields}
++
++@app.get('/api/dados')
++def data(actor=Depends(authenticated), db: Session = Depends(get_db)):
++    users = [public_user(db, u) for u in db.query(Usuario).order_by(Usuario.nome)]
++    limits = []
++    for limit in db.query(Limite):
++        row = asdict(limit, ['cargo', 'setor_id', 'maximo', 'habilitado', 'alerta_percentual', 'pode_cadastrar'])
++        row['utilizado'] = occupancy(db, limit.cargo, limit.setor_id)
++        row['disponivel'] = max(0, limit.maximo - row['utilizado'])
++        row['alerta'] = row['utilizado'] >= limit.maximo * limit.alerta_percentual / 100
++        limits.append(row)
++    from app.config import get_settings
++    return {'modo_teste': get_settings().ENVIRONMENT == 'test', 'usuarios': users, 'perfis': [asdict(p, ['id', 'nome', 'permissoes']) for p in db.query(Perfil)],
++            'setores': [asdict(s, ['id', 'nome', 'descricao', 'ativo', 'modulos', 'cargos']) for s in db.query(Setor)],
++            'limites': limits, 'cargos': CARGOS, 'catalogo': catalog(db),
++            'regras': [asdict(r, ['setor_id', 'cargo', 'permissao', 'permitido']) for r in db.query(Regra)],
++            'excecoes': [asdict(e, ['usuario_id', 'setor_id', 'permissao', 'permitido']) for e in db.query(Excecao)],
++            'administradores': sorted(admins()), 'total': len(users),
++            'estados': {s: sum(u['estado'] == s for u in users) for s in ['ativo', 'bloqueado', 'desativado', 'pendente']}}
++
++class Confirmed(BaseModel):
++    model_config = ConfigDict(extra='forbid')
++    justificativa: str = Field(min_length=5, max_length=500)
++    confirmar: bool
++
++def confirmed(data):
++    if not data.confirmar:
++        raise HTTPException(422, 'Confirme explicitamente a operação.')
++
++class SectorInput(Confirmed):
++    nome: str = Field(min_length=2, max_length=100)
++    descricao: str = Field(default='', max_length=500)
++    ativo: bool = True
++    modulos: list[str]
++    cargos: list[str]
++
++@app.put('/api/setores/{sid}')
++def save_sector(sid: int, data: SectorInput, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    confirmed(data)
++    if any(c not in CARGOS for c in data.cargos) or any(m not in {k.split(':')[0] for k in catalog(db)} for m in data.modulos):
++        raise HTTPException(422, 'Cargo ou módulo não encontrado no sistema.')
++    with mutation(db):
++        sector = db.get(Setor, sid) if sid else Setor()
++        if not sector:
++            raise HTTPException(404, 'Setor não encontrado.')
++        before = asdict(sector, ['nome', 'descricao', 'ativo', 'modulos', 'cargos']) if sid else None
++        if sid:
++            assigned = {v.cargo for v in db.query(Vinculo).filter_by(setor_id=sid)}
++            if not assigned.issubset(set(data.cargos)):
++                raise HTTPException(409, 'Existem usuários com cargos que seriam removidos do setor.')
++        for field in ['nome', 'descricao', 'ativo', 'modulos', 'cargos']:
++            setattr(sector, field, getattr(data, field))
++        db.add(sector)
++        db.flush()
++        audit(db, actor, 'setor_salvo', 'central_setores', sector.id, before, asdict(sector, ['nome', 'descricao', 'ativo', 'modulos', 'cargos']), data.justificativa)
++    return {'id': sector.id}
++
++class LimitInput(Confirmed):
++    maximo: int = Field(ge=0, le=1000000)
++    habilitado: bool
++    alerta_percentual: int = Field(ge=1, le=100)
++    pode_cadastrar: bool = False
++
++@app.put('/api/limites/{cargo}/{sid}')
++def save_limit(cargo: str, sid: int, data: LimitInput, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    confirmed(data)
++    check_cargo(cargo)
++    if sid < 0 or (sid and not db.get(Setor, sid)):
++        raise HTTPException(422, 'Setor inválido.')
++    with mutation(db):
++        limit = db.get(Limite, (cargo, sid))
++        before = asdict(limit, ['maximo', 'habilitado', 'alerta_percentual', 'pode_cadastrar']) if limit else None
++        if not limit:
++            limit = Limite(cargo=cargo, setor_id=sid)
++            db.add(limit)
++        for f in ['maximo', 'habilitado', 'alerta_percentual', 'pode_cadastrar']:
++            setattr(limit, f, getattr(data, f))
++        audit(db, actor, 'limite_alterado', 'central_limites', f'{cargo}/{sid}', before, data.model_dump(exclude={'confirmar', 'justificativa'}), data.justificativa)
++    used = occupancy(db, cargo, sid)
++    return {'utilizado': used, 'excedido': used > data.maximo}
++
++class LinkInput(BaseModel):
++    model_config = ConfigDict(extra='forbid')
++    setor_id: int = Field(gt=0)
++    cargo: str
++    responsavel_id: int | None = None
++
++class UserInput(Confirmed):
++    nome: str = Field(min_length=2, max_length=120)
++    usuario: str = Field(min_length=2, max_length=60, pattern=r'^[a-zA-Z0-9_.@-]+$')
++    email: str | None = Field(default=None, max_length=160)
++    perfil_id: str
++    cargo: str
++    estado: str
++    vinculos: list[LinkInput]
++
++def save_user_transaction(db, actor, uid, data):
++    confirmed(data)
++    check_cargo(data.cargo)
++    if data.email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', data.email):
++        raise HTTPException(422, 'E-mail inválido.')
++    if data.estado not in {'ativo', 'bloqueado', 'desativado', 'pendente'} or not db.get(Perfil, data.perfil_id):
++        raise HTTPException(422, 'Estado ou perfil inválido.')
++    user = db.get(Usuario, uid) if uid else None
++    if uid and not user:
++        raise HTTPException(404, 'Usuário não encontrado.')
++    if uid == actor.id and (data.perfil_id != user.perfil_id or data.cargo != (db.get(ContaCentral, uid).cargo if db.get(ContaCentral, uid) else data.cargo)):
++        raise HTTPException(403, 'Não é permitido alterar o próprio cargo ou perfil.')
++    if user and (data.estado != 'ativo' or data.perfil_id != 'administrador'):
++        protect_admin(db, uid)
++    if user and not user.senha_definida and data.estado == 'ativo':
++        raise HTTPException(409, 'Usuário precisa aceitar o convite antes da ativação.')
++    if data.estado == 'pendente' and user and user.senha_definida:
++        raise HTTPException(422, 'Use redefinição de senha para iniciar um novo convite.')
++    links = [v.model_dump() for v in data.vinculos]
++    for link in links:
++        check_cargo(link['cargo'])
++    if links and min(RANK[link['cargo']] for link in links) != RANK[data.cargo]:
++        raise HTTPException(422, 'O cargo central deve ser o cargo de maior autoridade entre os vínculos de setor.')
++    validate_links(db, uid, links)
++    if user and data.estado in {'bloqueado', 'desativado'} and db.query(Vinculo).filter_by(responsavel_id=uid).count():
++        raise HTTPException(409, 'Transfira os subordinados antes de bloquear ou desativar o responsável.')
++    for child in db.query(Vinculo).filter_by(responsavel_id=uid).all() if uid else []:
++        if RANK[data.cargo] >= RANK[child.cargo]:
++            raise HTTPException(409, 'Cargo incompatível com os subordinados existentes.')
++    if data.estado in {'ativo', 'pendente'}:
++        previous_account = db.get(ContaCentral, uid) if uid else None
++        occupying = bool(user and user.ativo and previous_account and previous_account.estado in {'ativo', 'pendente'})
++        if not occupying or previous_account.cargo != data.cargo:
++            check_limit(db, data.cargo, exclude=uid)
++        for link in links:
++            previous_link = db.query(Vinculo).filter_by(usuario_id=uid, setor_id=link['setor_id']).first() if uid else None
++            if not occupying or not previous_link or previous_link.cargo != link['cargo']:
++                check_limit(db, link['cargo'], link['setor_id'], exclude=uid)
++    before = public_user(db, user) if user else None
++    invitation = None
++    if not user:
++        invitation = gerar_token_opaco()
++        user = Usuario(nome=data.nome, usuario=data.usuario, email=data.email, perfil_id=data.perfil_id,
++                       senha_hash=hash_senha(gerar_token_opaco()), ativo=True, senha_definida=False,
++                       convite_token_hash=hash_token_opaco(invitation), convite_expira_em=datetime.now(timezone.utc) + timedelta(hours=72))
++        db.add(user)
++        db.flush()
++        uid = user.id
++        state = 'pendente'
++    else:
++        state = data.estado
++    user.nome, user.email, user.perfil_id = data.nome, data.email, data.perfil_id
++    if data.usuario != user.usuario:
++        raise HTTPException(422, 'O identificador de login existente não pode ser alterado pelo painel.')
++    user.ativo = state in {'ativo', 'pendente'}
++    account = db.get(ContaCentral, uid)
++    if not account:
++        account = ContaCentral(usuario_id=uid, cargo=data.cargo, estado=state, criado_por=actor.id if invitation else None)
++        db.add(account)
++    account.cargo, account.estado = data.cargo, state
++    db.query(Vinculo).filter_by(usuario_id=uid).delete()
++    for link in links:
++        db.add(Vinculo(usuario_id=uid, **link))
++    db.flush()
++    revoke(db, uid)
++    audit(db, actor, 'usuario_salvo', 'usuarios', uid, before, public_user(db, user), data.justificativa)
++    return {'id': uid, 'convite': invitation}
++
++@app.put('/api/usuarios/{uid}')
++def save_user(uid: int, data: UserInput, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    try:
++        with mutation(db):
++            result = save_user_transaction(db, actor, uid, data)
++        return result
++    except HTTPException as error:
++        audit(db, actor, 'operacao_negada', 'usuarios', uid, None, {'motivo': error.detail}, data.justificativa)
++        db.commit()
++        raise
++    except IntegrityError:
++        raise HTTPException(409, 'Nome de usuário ou e-mail já utilizado.')
++
++@app.post('/api/usuarios/{uid}/sessoes')
++def end_sessions(uid: int, data: Confirmed, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    confirmed(data)
++    if not db.get(Usuario, uid):
++        raise HTTPException(404, 'Usuário não encontrado.')
++    with mutation(db):
++        revoke(db, uid)
++        audit(db, actor, 'sessoes_revogadas', 'usuarios', uid, None, None, data.justificativa)
++    return {'ok': True}
++
++@app.post('/api/usuarios/{uid}/senha')
++def reset_password(uid: int, data: Confirmed, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    confirmed(data)
++    user = db.get(Usuario, uid)
++    if not user:
++        raise HTTPException(404, 'Usuário não encontrado.')
++    protect_admin(db, uid)
++    if not user.ativo:
++        raise HTTPException(409, 'Reative a conta antes de iniciar a redefinição.')
++    with mutation(db):
++        token = gerar_token_opaco()
++        user.senha_definida = False
++        user.convite_token_hash = hash_token_opaco(token)
++        user.convite_expira_em = datetime.now(timezone.utc) + timedelta(hours=72)
++        account = db.get(ContaCentral, uid)
++        if account:
++            account.estado = 'pendente'
++        revoke(db, uid)
++        audit(db, actor, 'senha_redefinicao_iniciada', 'usuarios', uid, None, {'expira_em': user.convite_expira_em.isoformat()}, data.justificativa)
++    return {'convite': token}
++
++class PermissionInput(Confirmed):
++    setor_id: int = Field(gt=0)
++    cargo: str = ''
++    usuario_id: int | None = None
++    permissao: str
++    estado: str
++
++@app.put('/api/permissoes')
++def save_permission(data: PermissionInput, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    confirmed(data)
++    sector = db.get(Setor, data.setor_id)
++    if not sector or data.permissao not in catalog(db) or data.permissao.split(':')[0] not in sector.modulos:
++        raise HTTPException(422, 'Permissão fora dos módulos autorizados do setor.')
++    if data.estado not in {'herdar', 'permitido', 'negado'}:
++        raise HTTPException(422, 'Estado inválido.')
++    if data.usuario_id:
++        if data.usuario_id == actor.id:
++            deny(db, actor, 'Não é permitido ampliar ou alterar as próprias permissões.')
++        if not db.query(Vinculo).filter_by(usuario_id=data.usuario_id, setor_id=data.setor_id).first():
++            raise HTTPException(422, 'Usuário não vinculado ao setor.')
++        model, key = Excecao, (data.usuario_id, data.setor_id, data.permissao)
++    else:
++        check_cargo(data.cargo)
++        if data.cargo not in sector.cargos:
++            raise HTTPException(422, 'Cargo não autorizado no setor.')
++        model, key = Regra, (data.setor_id, data.cargo, data.permissao)
++    with mutation(db):
++        obj = db.get(model, key)
++        before = obj.permitido if obj else None
++        if data.estado == 'herdar':
++            if obj:
++                db.delete(obj)
++        else:
++            if not obj:
++                obj = model(**({'usuario_id': data.usuario_id, 'setor_id': data.setor_id, 'permissao': data.permissao} if data.usuario_id else {'setor_id': data.setor_id, 'cargo': data.cargo, 'permissao': data.permissao}))
++                db.add(obj)
++            obj.permitido = data.estado == 'permitido'
++        audit(db, actor, 'permissao_alterada', model.__tablename__, '/'.join(map(str, key)), before, {'estado': data.estado}, data.justificativa)
++        if data.usuario_id:
++            revoke(db, data.usuario_id)
++    return {'ok': True}
++
++@app.get('/api/permissoes/{uid}/{sid}')
++def get_permissions(uid: int, sid: int, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    user = db.get(Usuario, uid)
++    if not user:
++        raise HTTPException(404, 'Usuário não encontrado.')
++    return [{'permissao': key, 'permitido': effective(db, user, sid, key)[0], 'origem': effective(db, user, sid, key)[1]} for key in catalog(db)]
++
++@app.get('/api/historico')
++def history(pagina: int = 1, actor=Depends(authenticated), db: Session = Depends(get_db)):
++    if pagina < 1:
++        raise HTTPException(422, 'Página inválida.')
++    query = db.query(AuditLog).order_by(AuditLog.id.desc())
++    return {'total': query.count(), 'itens': [asdict(log, ['id', 'usuario_id', 'acao', 'entidade', 'entidade_id', 'antes', 'depois', 'criado_em', 'categoria']) for log in query.offset((pagina - 1) * 50).limit(50)]}
++
++@app.get('/')
++def index():
++    return FileResponse(STATIC / 'index.html')
++
++app.mount('/assets', StaticFiles(directory=STATIC), name='assets')
+--- /dev/null
++++ b/app/central/models.py
+@@ -0,0 +1,70 @@
++from datetime import datetime
++from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, func
++from sqlalchemy.orm import Mapped, mapped_column
++from app.database import Base
++
++CARGOS = ('dono', 'gerente', 'coordenador', 'colaborador')
++
++class ContaCentral(Base):
++    __tablename__ = 'central_contas'
++    usuario_id: Mapped[int] = mapped_column(ForeignKey('usuarios.id'), primary_key=True)
++    cargo: Mapped[str] = mapped_column(String(20), nullable=False)
++    estado: Mapped[str] = mapped_column(String(20), nullable=False)
++    criado_por: Mapped[int | None] = mapped_column(ForeignKey('usuarios.id'))
++    versao_sessao: Mapped[int] = mapped_column(default=0)
++
++class Setor(Base):
++    __tablename__ = 'central_setores'
++    id: Mapped[int] = mapped_column(primary_key=True)
++    nome: Mapped[str] = mapped_column(String(100), unique=True)
++    descricao: Mapped[str] = mapped_column(String(500), default='')
++    ativo: Mapped[bool] = mapped_column(Boolean, default=True)
++    modulos: Mapped[list] = mapped_column(JSON, default=list)
++    cargos: Mapped[list] = mapped_column(JSON, default=list)
++
++class Vinculo(Base):
++    __tablename__ = 'central_vinculos'
++    __table_args__ = (UniqueConstraint('usuario_id', 'setor_id'),)
++    id: Mapped[int] = mapped_column(primary_key=True)
++    usuario_id: Mapped[int] = mapped_column(ForeignKey('usuarios.id'))
++    setor_id: Mapped[int] = mapped_column(ForeignKey('central_setores.id'))
++    cargo: Mapped[str] = mapped_column(String(20))
++    responsavel_id: Mapped[int | None] = mapped_column(ForeignKey('usuarios.id'))
++
++class Limite(Base):
++    __tablename__ = 'central_limites'
++    cargo: Mapped[str] = mapped_column(String(20), primary_key=True)
++    # 0 = empresa; demais valores são IDs validados de setores.
++    setor_id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    habilitado: Mapped[bool] = mapped_column(Boolean)
++    maximo: Mapped[int] = mapped_column(Integer)
++    alerta_percentual: Mapped[int] = mapped_column(Integer, default=80)
++    pode_cadastrar: Mapped[bool] = mapped_column(Boolean, default=False)
++
++class Regra(Base):
++    __tablename__ = 'central_regras'
++    setor_id: Mapped[int] = mapped_column(ForeignKey('central_setores.id'), primary_key=True)
++    cargo: Mapped[str] = mapped_column(String(20), primary_key=True)
++    permissao: Mapped[str] = mapped_column(String(100), primary_key=True)
++    permitido: Mapped[bool] = mapped_column(Boolean)
++
++class Excecao(Base):
++    __tablename__ = 'central_excecoes'
++    usuario_id: Mapped[int] = mapped_column(ForeignKey('usuarios.id'), primary_key=True)
++    setor_id: Mapped[int] = mapped_column(ForeignKey('central_setores.id'), primary_key=True)
++    permissao: Mapped[str] = mapped_column(String(100), primary_key=True)
++    permitido: Mapped[bool] = mapped_column(Boolean)
++
++class Sessao(Base):
++    __tablename__ = 'central_sessoes'
++    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
++    usuario_id: Mapped[int] = mapped_column(ForeignKey('usuarios.id'))
++    csrf: Mapped[str] = mapped_column(String(64))
++    versao: Mapped[int] = mapped_column(default=0)
++    expira_em: Mapped[datetime] = mapped_column(DateTime(timezone=True))
++    criada_em: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
++
++class VersaoAutenticacao(Base):
++    __tablename__ = 'central_versoes_auth'
++    usuario_id: Mapped[int] = mapped_column(ForeignKey('usuarios.id'), primary_key=True)
++    versao: Mapped[int] = mapped_column(default=0)
+--- /dev/null
++++ b/app/central/policy.py
+@@ -0,0 +1,171 @@
++"""Regras transacionais; não cria tabelas nem dados automaticamente."""
++import os
++from contextlib import contextmanager
++from threading import RLock
++from datetime import datetime, timezone
++from fastapi import HTTPException
++from sqlalchemy import inspect, text
++from app.models.usuario import Usuario, RefreshToken
++from app.auditoria_utils import registrar
++from app.central.models import CARGOS, ContaCentral, Setor, Vinculo, Limite, Regra, Excecao, Sessao, VersaoAutenticacao
++
++_lock = RLock()
++RANK = {cargo: i for i, cargo in enumerate(CARGOS)}
++
++def admins():
++    from app.config import get_settings
++    return {int(x.strip()) for x in get_settings().CENTRAL_ADMIN_IDS.split(',') if x.strip().isdigit()}
++
++def central_admin(user):
++    return user.id in admins() and user.perfil_id == 'administrador' and user.ativo
++
++def installed(db):
++    # Inspeciona a conexão da própria sessão, sem abrir/fechar outra conexão
++    # que poderia afetar uma transação em um pool de conexão única de teste.
++    return inspect(db.connection()).has_table('central_contas')
++
++def deny(db, actor, message):
++    # Desfaz a tentativa; grava somente a negativa, sem valores secretos.
++    db.rollback()
++    log = registrar(db, usuario_id=actor.id if actor else None, acao='central_acesso_negado', entidade='central', depois={'motivo': message, 'resultado': 'negado'})
++    log.categoria = 'falha_acesso'
++    db.commit()
++    raise HTTPException(403, message)
++
++def audit(db, actor, action, entity, ident, before, after, reason):
++    denied = 'negad' in action
++    log = registrar(db, usuario_id=actor.id, acao='central_' + action, entidade=entity,
++                    entidade_id=str(ident), antes=before, depois={'valores': after, 'justificativa': reason, 'resultado': 'negado' if denied else 'sucesso'})
++    if denied:
++        log.categoria = 'falha_acesso'
++
++@contextmanager
++def mutation(db):
++    # Um mutex transacional global também serializa alterações de vínculos/limites.
++    # PostgreSQL: vale entre processos e entre os dois serviços.
++    with _lock:
++        if db.get_bind().dialect.name == 'postgresql':
++            db.execute(text('SELECT pg_advisory_xact_lock(7349102301)'))
++        try:
++            yield
++            db.commit()
++        except Exception:
++            db.rollback()
++            raise
++
++def check_cargo(cargo):
++    if cargo not in CARGOS:
++        raise HTTPException(422, 'Cargo inválido.')
++
++def occupancy(db, cargo, setor_id=0, exclude=None):
++    q = db.query(ContaCentral).join(Usuario, Usuario.id == ContaCentral.usuario_id).filter(
++        Usuario.ativo.is_(True), ContaCentral.estado.in_(['ativo', 'pendente']))
++    if exclude:
++        q = q.filter(ContaCentral.usuario_id != exclude)
++    if setor_id:
++        q = q.join(Vinculo, Vinculo.usuario_id == ContaCentral.usuario_id).filter(Vinculo.setor_id == setor_id, Vinculo.cargo == cargo)
++    else:
++        q = q.filter(ContaCentral.cargo == cargo)
++    return q.count()
++
++def check_limit(db, cargo, setor_id=0, exclude=None):
++    rule = db.get(Limite, (cargo, setor_id))
++    if not rule and setor_id:
++        return  # específico opcional; global é obrigatório
++    if not rule or not rule.habilitado:
++        raise HTTPException(409, f'Cadastro de {cargo} não liberado. Configure o limite global.')
++    if occupancy(db, cargo, setor_id, exclude) >= rule.maximo:
++        raise HTTPException(409, f'Limite de {cargo} atingido no contexto {setor_id or "empresa"}.')
++
++def validate_links(db, uid, links):
++    seen = set()
++    for link in links:
++        sid, cargo, parent = link['setor_id'], link['cargo'], link.get('responsavel_id')
++        check_cargo(cargo)
++        if sid in seen:
++            raise HTTPException(422, 'Setor repetido.')
++        seen.add(sid)
++        sector = db.get(Setor, sid)
++        previous = db.query(Vinculo).filter_by(usuario_id=uid, setor_id=sid).first() if uid else None
++        unchanged = bool(previous and previous.cargo == cargo and previous.responsavel_id == parent)
++        if not sector or (not sector.ativo and not unchanged) or cargo not in sector.cargos:
++            raise HTTPException(422, 'Setor inativo ou cargo não autorizado no setor.')
++        if cargo == 'dono':
++            if parent:
++                raise HTTPException(422, 'Dono não possui responsável hierárquico.')
++            continue
++        if not parent or parent == uid:
++            raise HTTPException(422, 'Informe um responsável válido.')
++        pv = db.query(Vinculo).filter_by(usuario_id=parent, setor_id=sid).first()
++        pu = db.get(Usuario, parent)
++        parent_account = db.get(ContaCentral, parent)
++        if not pv or not pu or not pu.ativo or not pu.senha_definida or (parent_account and parent_account.estado != 'ativo') or RANK[pv.cargo] >= RANK[cargo]:
++            raise HTTPException(422, 'Responsável deve estar ativo e possuir cargo superior no mesmo setor.')
++        visited = {uid} if uid else set()
++        current = parent
++        while current:
++            if current in visited:
++                raise HTTPException(422, 'Vínculo criaria um ciclo na hierarquia.')
++            visited.add(current)
++            v = db.query(Vinculo).filter_by(usuario_id=current, setor_id=sid).first()
++            current = v.responsavel_id if v else None
++    # Também verifica subordinados após uma mudança do cargo do responsável.
++    if uid:
++        by_sector = {v['setor_id']: v for v in links}
++        for child in db.query(Vinculo).filter_by(responsavel_id=uid):
++            parent = by_sector.get(child.setor_id)
++            if not parent or RANK[parent['cargo']] >= RANK[child.cargo]:
++                raise HTTPException(409, 'Transfira os subordinados antes de remover ou reduzir o cargo do responsável.')
++
++def effective(db, user, sid, permission):
++    account = db.get(ContaCentral, user.id)
++    if not user.ativo or not account or account.estado != 'ativo':
++        return False, 'negado'
++    sector = db.get(Setor, sid)
++    member = db.query(Vinculo).filter_by(usuario_id=user.id, setor_id=sid).first()
++    if not sector or not sector.ativo or not member or member.cargo not in sector.cargos or permission.split(':')[0] not in sector.modulos:
++        return False, 'fora do escopo'
++    exception = db.get(Excecao, (user.id, sid, permission))
++    if exception:
++        return exception.permitido, 'personalizado'
++    rule = db.get(Regra, (sid, member.cargo, permission))
++    return bool(rule and rule.permitido), 'herdado'
++
++def revoke(db, uid):
++    db.query(RefreshToken).filter_by(usuario_id=uid).update({'revogado': True})
++    db.query(Sessao).filter_by(usuario_id=uid).delete()
++    account = db.get(ContaCentral, uid)
++    if account:
++        account.versao_sessao += 1
++    version = db.get(VersaoAutenticacao, uid)
++    if not version:
++        version = VersaoAutenticacao(usuario_id=uid, versao=0)
++        db.add(version)
++    version.versao += 1
++
++def epoch(db, uid):
++    version = db.get(VersaoAutenticacao, uid)
++    return version.versao if version else 0
++
++def protect_admin(db, uid):
++    if uid in admins() and db.query(Usuario).filter(Usuario.id.in_(admins()), Usuario.perfil_id == 'administrador', Usuario.ativo.is_(True)).count() <= 1:
++        raise HTTPException(409, 'Não é permitido desativar ou remover o último administrador central.')
++
++def legacy_guard(db, user, permissions):
++    """O legado não tem setor nos registros operacionais. Nega o escopo ambíguo.
++
++    Usuários ainda não vinculados ao controle central mantêm o RBAC original.
++    Usuários gerenciados não recebem acesso global por acidente.
++    """
++    if not installed(db):
++        return
++    if any(p == 'usuarios:write' for p in permissions):
++        deny(db, user, 'Administre usuários pelo painel central ou pela API /governanca/convites.')
++    account = db.get(ContaCentral, user.id)
++    if not account:
++        return
++    if account.estado != 'ativo':
++        deny(db, user, 'Conta bloqueada, desativada ou pendente.')
++    if central_admin(user):
++        return
++    deny(db, user, 'Este endpoint legado não possui isolamento por setor. Acesso negado até integração do módulo.')
+--- /dev/null
++++ b/app/central/static/app.js
+@@ -0,0 +1,168 @@
++'use strict';
++const $ = (selector, root = document) => root.querySelector(selector);
++const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
++const moduleLabels = {programacao:'Programação',automacoes:'Automações',notificacoes:'Notificações',auditoria:'Auditoria',usuarios:'Usuários',parametros:'Parâmetros',supervisao:'Supervisão',relatorios:'Relatórios',equipes:'Equipes',estoque:'Estoque',compras:'Compras',financeiro:'Financeiro',frota:'Frota',obras:'Obras',clientes:'Clientes',dashboard:'Visão geral'};
++const title = value => moduleLabels[value] || String(value ?? '').replace(/(^|[ -])\p{L}/gu, char => char.toUpperCase());
++const pages = [['overview','Visão geral','◫'],['users','Usuários','♙'],['roles','Cargos e liberações','▣'],['sectors','Setores','▤'],['permissions','Permissões','◇'],['hierarchy','Hierarquia e equipes','♧'],['history','Histórico de atividades','◷'],['security','Segurança e configurações','⚙']];
++let state, csrf = '', actor, currentPage = 'overview', historyPage = 1, lastHistory, loginStage = 'login';
++let filters = {search:'', cargo:'', estado:''};
++let modalSubmit;
++const names = list => list.map(x=>esc(title(x))).join(', ');
++const sectorName = sid => state.setores.find(s=>s.id===Number(sid))?.nome || `Setor #${sid}`;
++const userName = uid => state.usuarios.find(u=>u.id===Number(uid))?.nome || (uid ? `Usuário #${uid}` : 'Sem responsável');
++const status = value => `<span class="status ${['ativo','pendente','bloqueado','desativado'].includes(value)?value:'neutral'}">${esc(title(value))}</span>`;
++const field = (name, label, value='', type='text', extra='') => `<label>${esc(label)}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
++const options = (list, selected, empty) => (empty !== undefined ? `<option value="">${esc(empty)}</option>` : '') + list.map(([value,label])=>`<option value="${esc(value)}" ${String(value)===String(selected)?'selected':''}>${esc(label)}</option>`).join('');
++const select = (name,label,list,selected='',empty) => `<label>${esc(label)}<select name="${name}">${options(list,selected,empty)}</select></label>`;
++const check = (name,label,checked=false,value='on') => `<label><input type="checkbox" name="${name}" value="${esc(value)}" ${checked?'checked':''}>${esc(label)}</label>`;
++function toast(message) { $('#toast').textContent=message; $('#toast').hidden=false; clearTimeout(toast.timer); toast.timer=setTimeout(()=>$('#toast').hidden=true,6500); }
++async function api(path, method='GET', body) {
++ const headers = {'Content-Type':'application/json'}; if(csrf) headers['X-CSRF-Token']=csrf;
++ const response = await fetch('/api'+path,{method,headers,credentials:'same-origin',body:body===undefined?undefined:JSON.stringify(body)});
++ let data; try { data=await response.json(); } catch { data={detail:'O servidor não respondeu. Verifique a configuração e a conexão com o banco.'}; }
++ if(!response.ok) {
++  if(response.status===401 && !path.startsWith('/login')) showLogin();
++  throw new Error(Array.isArray(data.detail)?data.detail.map(e=>`${e.loc?.slice(1).join('.')}: ${e.msg}`).join('\n'):(data.detail||'Não foi possível realizar a operação.'));
++ }
++ return data;
++}
++function showLogin() { csrf=''; state=undefined; actor=undefined; $('#workspace').hidden=true; $('#login').hidden=false; }
++async function refresh() { state=await api('/dados'); $('#updated').textContent='Atualizado às '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}); await render(); }
++async function enter(session) {
++ csrf=session.csrf; actor=session; $('#actor-name').textContent=session.nome;
++ $('.avatar').textContent=session.nome?.charAt(0).toUpperCase()||'A';
++ await refresh(); $('#login').hidden=true; $('#workspace').hidden=false;
++}
++$('#login-form').addEventListener('submit',async event=>{
++ event.preventDefault(); const form=event.currentTarget, button=$('button[type=submit]',form); button.disabled=true; $('#login-error').textContent='';
++ try {
++  const values=Object.fromEntries(new FormData(form));
++  const result=await api(loginStage==='login'?'/login':'/login/continuar','POST',values);
++  form.reset();
++  if(result.etapa==='concluido') { loginStage='login'; await enter(await api('/session')); restoreLogin(); }
++  else { loginStage=result.etapa; const input=result.etapa==='mfa'?field('codigo','Código do autenticador','','text','required inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code"'):field('nova_senha','Nova senha','','password','required minlength="12" maxlength="72" autocomplete="new-password"'); form.innerHTML=`<div class="eyebrow">VERIFICAÇÃO DE ACESSO</div><h2>${result.etapa==='mfa'?'Confirmar identidade':'Atualizar senha'}</h2><p class="muted">${esc(result.mensagem)}</p>${input}<button class="primary" type="submit">Continuar</button><button type="button" data-action="restart-login">Voltar ao login</button><p id="login-error" class="error" role="alert"></p>`; }
++ } catch(error) { $('#login-error').textContent=error.message; if(loginStage!=='login') setTimeout(()=>{restoreLogin(); $('#login-error').textContent=error.message+' Entre novamente.';},2500); }
++ finally { button.disabled=false; }
++});
++const initialLogin = $('#login-form').innerHTML;
++function restoreLogin() { loginStage='login'; $('#login-form').innerHTML=initialLogin; }
++$('#login-form').addEventListener('click',event=>{if(event.target.closest('[data-action="restart-login"]'))restoreLogin();});
++$('#logout').addEventListener('click',async()=>{try{await api('/logout','POST',{});showLogin();restoreLogin();}catch(e){toast(e.message);}});
++$('#menu').addEventListener('click',()=>$('#sidebar').classList.toggle('open'));
++$('#navigation').innerHTML=pages.map(([key,label,icon])=>`<button data-page="${key}"><span class="nav-icon" aria-hidden="true">${icon}</span>${label}</button>`).join('');
++$('#navigation').addEventListener('click',async event=>{const button=event.target.closest('[data-page]');if(button){currentPage=button.dataset.page;$('#sidebar').classList.remove('open');try{await render();}catch(e){toast(e.message);}}});
++function head(name,description,action='') { return `<div class="page-head"><div><div class="eyebrow">CONTROLE CENTRAL</div><h1>${esc(name)}</h1><p>${esc(description)}</p></div>${action}</div>`; }
++function table(headers, rows) {return `<div class="table-wrap"><table><thead><tr>${headers.map(h=>`<th scope="col">${h}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.join(''):`<tr><td colspan="${headers.length}" class="empty">Nenhum registro encontrado.</td></tr>`}</tbody></table></div>`;}
++function recentRows(items) {return items.map(log=>`<tr><td>${esc(log.acao.replace(/^central_/,'').replaceAll('_',' '))}<small>${esc(log.entidade)} #${esc(log.entidade_id||'—')}</small></td><td>${esc(userName(log.usuario_id))}</td><td>${esc(new Date(log.criado_em).toLocaleString('pt-BR'))}</td><td><button data-action="audit-detail" data-id="${log.id}">Detalhes</button></td></tr>`);}
++async function render() {
++ if(!state)return;
++ $('#breadcrumb').textContent=pages.find(p=>p[0]===currentPage)[1];
++ $$('#navigation button').forEach(b=>b.classList.toggle('active',b.dataset.page===currentPage));
++ const output=$('#content');
++ if(currentPage==='overview') {
++  const all=state.total; const count=c=>state.usuarios.filter(u=>u.cargo===c).length;
++  const unmanaged=state.usuarios.filter(u=>!u.gerenciado).length;
++  output.innerHTML=head('Visão geral','Pessoas, acessos e disponibilidade em um só lugar.',`<span class="subtle-badge">${state.modo_teste?'TESTE ISOLADO · DADOS SINTÉTICOS':'BANCO COMPARTILHADO'}</span>`)+
++   `<div class="metrics">${[['Total de usuários',all,'Todos os cadastros existentes'],['Contas ativas',state.estados.ativo,'Acesso habilitado'],['Bloqueados / desativados',state.estados.bloqueado+state.estados.desativado,'Histórico preservado'],['Ativação pendente',state.estados.pendente,'Aguardando definição de senha']].map(([label,value,detail])=>`<div class="metric"><div class="metric-label">${label}</div><strong>${value}</strong><small>${detail}</small></div>`).join('')}</div>`+
++   (unmanaged?`<div class="notice info">${unmanaged} usuário(s) ainda sem cargo e vínculos no controle central. Revise cada cadastro na aba Usuários; o painel não atribui cargos automaticamente.</div>`:'')+
++   `<div class="grid-two"><section class="panel"><div class="panel-head"><h2>Distribuição por cargo</h2><button data-page="users" class="text-button">Ver usuários</button></div>${state.cargos.map(c=>`<div class="role-row"><span>${title(c)}</span><progress value="${count(c)}" max="${Math.max(all,1)}" aria-label="${title(c)}"></progress><b>${count(c)}</b></div>`).join('')}<p class="help">Contagem de usuários vinculados ao controle central.</p></section><section class="panel"><div class="panel-head"><h2>Disponibilidade de cadastros</h2><button data-page="roles" class="text-button">Configurar</button></div>${state.limites.filter(l=>!l.setor_id).map(l=>`<div class="settings-row"><span>${title(l.cargo)}<small class="muted"> · ${l.utilizado} / ${l.maximo}</small></span>${l.habilitado?`<span class="status ${l.disponivel?'ativo':'pendente'}">${l.disponivel} vaga(s)</span>`:status('desativado')}</div>`).join('')||'<div class="empty">Nenhum limite aprovado.<br>Configure os limites para liberar novos cadastros.</div>'}<p class="help">Convites pendentes reservam vagas para evitar ultrapassar os limites.</p></section></div>`+
++   `<section class="panel"><div class="panel-head"><h2>Usuários por setor</h2></div>${table(['Setor','Vinculados','Estado'],state.setores.map(s=>`<tr><td>${esc(s.nome)}</td><td>${state.usuarios.filter(u=>u.vinculos.some(v=>v.setor_id===s.id)).length}</td><td>${status(s.ativo?'ativo':'desativado')}</td></tr>`))}</section><section class="panel"><div class="panel-head"><h2>Atividades recentes</h2><button data-page="history" class="text-button">Ver histórico</button></div><div id="recent-history" class="loading">Carregando atividades…</div></section>`;
++  const history=await api('/historico');lastHistory=history.itens;$('#recent-history').innerHTML=table(['Alteração','Autor','Data',''],recentRows(history.itens.slice(0,5)));
++ } else if(currentPage==='users') renderUsers();
++ else if(currentPage==='roles') output.innerHTML=head('Cargos e liberações','Limites globais e por setor, aprovados pelo administrador.','<button class="primary" data-action="limit-new">Configurar limite</button>')+
++  (state.limites.some(l=>l.utilizado>l.maximo)?'<div class="notice">Há limites abaixo da quantidade utilizada. Novos cadastros e reativações ficam bloqueados; nenhuma conta é desativada automaticamente.</div>':'')+
++  `<section class="panel">${table(['Cargo','Contexto','Utilização','Disponíveis','Liberação','Alerta',''],state.limites.map(l=>`<tr><td><b>${title(l.cargo)}</b></td><td>${l.setor_id?esc(sectorName(l.setor_id)):'Empresa inteira'}</td><td>${l.utilizado} / ${l.maximo}</td><td>${l.disponivel}</td><td>${status(l.habilitado?'ativo':'desativado')}</td><td>${l.alerta?'<span class="status pendente">Atenção</span>':'—'}</td><td><button data-action="limit-edit" data-cargo="${l.cargo}" data-sid="${l.setor_id}">Editar</button></td></tr>`))}<p class="help">Cada cargo exige um limite global aprovado. O limite por setor é opcional. Desabilitar impede cadastros e reativações, preservando as contas atuais.</p></section>`+
++  `<section class="panel"><h2>Delegação de cadastro</h2>${table(['Cargo','Pode cadastrar','Escopo'],[['Dono','Gerentes','Setores vinculados'],['Gerente','Coordenadores e colaboradores','Setores vinculados'],['Coordenador','Colaboradores','Própria responsabilidade'],['Colaborador','Nenhum usuário','Operações autorizadas']].map(row=>`<tr>${row.map(c=>`<td>${c}</td>`).join('')}</tr>`))}<p class="help">A delegação precisa ser habilitada no limite global do cargo de quem cadastra. A API compartilhada valida cargo, setor e responsável.</p></section>`;
++ else if(currentPage==='sectors') output.innerHTML=head('Setores','Contextos de trabalho, módulos e cargos autorizados.','<button class="primary" data-action="sector-new">Novo setor</button>')+
++  `<div class="card-grid">${state.setores.map(s=>`<article class="sector-card">${status(s.ativo?'ativo':'desativado')}<h2>${esc(s.nome)}</h2><p>${esc(s.descricao||'Sem descrição')}</p><div class="tags">${s.modulos.map(m=>`<span class="tag">${esc(title(m))}</span>`).join('')}</div><p>${state.usuarios.filter(u=>u.vinculos.some(v=>v.setor_id===s.id)).length} usuário(s) vinculado(s)<br><small>${names(s.cargos)}</small></p><button data-action="sector-edit" data-id="${s.id}">Editar setor</button></article>`).join('')||'<div class="panel empty">Nenhum setor criado. Cadastre os setores reais da empresa.</div>'}</div>`;
++ else if(currentPage==='permissions') renderPermissions();
++ else if(currentPage==='hierarchy') {
++  const issues=[];
++  state.usuarios.filter(u=>u.gerenciado&&!u.vinculos.length).forEach(u=>issues.push(`${u.nome}: sem vínculo de setor.`));
++  state.usuarios.forEach(u=>u.vinculos.forEach(v=>{if(v.cargo!=='dono'&&!state.usuarios.some(p=>p.id===v.responsavel_id&&p.estado==='ativo'&&p.vinculos.some(pv=>pv.setor_id===v.setor_id&&state.cargos.indexOf(pv.cargo)<state.cargos.indexOf(v.cargo))))issues.push(`${u.nome}: responsável inválido no setor ${sectorName(v.setor_id)}.`);}));
++  output.innerHTML=head('Hierarquia e equipes','Vínculos independentes em cada setor. Dono → Gerente → Coordenador → Colaborador.')+
++  (issues.length?`<div class="notice"><b>${issues.length} vínculo(s) para revisar</b><ul>${issues.map(i=>`<li>${esc(i)}</li>`).join('')}</ul></div>`:'')+
++  state.setores.map(s=>`<section class="panel"><div class="panel-head"><h2>${esc(s.nome)}</h2>${status(s.ativo?'ativo':'desativado')}</div>${state.usuarios.filter(u=>u.vinculos.some(v=>v.setor_id===s.id)).sort((a,b)=>state.cargos.indexOf(a.vinculos.find(v=>v.setor_id===s.id).cargo)-state.cargos.indexOf(b.vinculos.find(v=>v.setor_id===s.id).cargo)).map(u=>{const v=u.vinculos.find(v=>v.setor_id===s.id);return `<div class="hierarchy-row level-${state.cargos.indexOf(v.cargo)}"><div><strong>${esc(u.nome)}</strong> <span class="tag">${title(v.cargo)}</span><small>Responsável: ${esc(userName(v.responsavel_id))}</small></div><button data-action="user-edit" data-id="${u.id}">Editar vínculo</button></div>`;}).join('')||'<div class="empty">Nenhum usuário vinculado.</div>'}</section>`).join('');
++  if(!state.setores.length)output.innerHTML+='<div class="panel empty">Crie um setor para organizar as equipes.</div>';
++ } else if(currentPage==='history') {
++  const history=await api('/historico?pagina='+historyPage);lastHistory=history.itens;
++  output.innerHTML=head('Histórico de atividades','Registro de alterações e tentativas de acesso. Os registros não podem ser editados pelo painel.')+`<section class="panel">${table(['Alteração','Autor','Data',''],recentRows(history.itens))}<div class="pagination"><button data-action="history-prev" ${historyPage===1?'disabled':''}>Anterior</button><span>Página ${historyPage} · ${history.total} registros</span><button data-action="history-next" ${historyPage*50>=history.total?'disabled':''}>Próxima</button></div></section>`;
++ } else if(currentPage==='security') output.innerHTML=head('Segurança e configurações','Proteção do painel e integração com o sistema principal.')+
++  `<div class="grid-two"><section class="panel"><h2>Acesso administrativo</h2><div class="settings-row"><span>Administrador conectado</span><b>${esc(actor.nome)}</b></div><div class="settings-row"><span>IDs autorizados no servidor</span><b>${state.administradores.join(', ')||'Não configurados'}</b></div><div class="settings-row"><span>Validade da sessão</span><b>1 hora</b></div><div class="settings-row"><span>Proteção de operações</span><b>Sessão + CSRF</b></div><p class="help">A lista de administradores é definida nas variáveis de ambiente do servidor. Não existe cadastro público de administradores.</p></section><section class="panel"><h2>Conexão e execução</h2><div class="settings-row"><span>Endereço local</span><b>127.0.0.1:8765</b></div><div class="settings-row"><span>Autenticação</span><b>Contas existentes</b></div><div class="settings-row"><span>Senhas no banco</span><b>Hash bcrypt</b></div><div class="settings-row"><span>Exclusão definitiva</span><b>Indisponível</b></div><p class="help">Backup, restauração e migrações são operações externas documentadas no README. A interface não executa restaurações nem apaga históricos.</p></section></div><div class="notice">A integração do backend original é necessária para revogar tokens de acesso e proteger as rotas antigas. Registros operacionais ainda não possuem escopo de setor: usuários gerenciados têm acesso negado nessas rotas até a integração de cada módulo.</div>`;
++}
++function $$(selector,root=document){return [...root.querySelectorAll(selector)];}
++function renderUsers() {
++ $('#content').innerHTML=head('Usuários','Cadastros existentes, estados da conta e vínculos de acesso.','<button class="primary" data-action="user-new">Convidar usuário</button>')+
++ `<div class="toolbar"><input id="user-search" aria-label="Pesquisar usuários" placeholder="Buscar nome, e-mail, login, ID ou setor" value="${esc(filters.search)}"><select id="user-role" aria-label="Filtrar cargo">${options(state.cargos.map(c=>[c,title(c)]),filters.cargo,'Todos os cargos')}</select><select id="user-state" aria-label="Filtrar estado">${options(['ativo','bloqueado','desativado','pendente'].map(s=>[s,title(s)]),filters.estado,'Todos os estados')}</select></div><section class="panel" id="user-table"></section>`;
++ const update=()=>{
++  const q=filters.search.toLocaleLowerCase('pt-BR');
++  const users=state.usuarios.filter(u=>(!filters.cargo||u.cargo===filters.cargo)&&(!filters.estado||u.estado===filters.estado)&&[u.nome,u.email,u.usuario,u.id,...u.vinculos.map(v=>sectorName(v.setor_id))].join(' ').toLocaleLowerCase('pt-BR').includes(q));
++  $('#user-table').innerHTML=table(['Usuário','Cargo / perfil','Setores','Estado',''],users.map(u=>`<tr><td><span class="user-cell">${esc(u.nome)}</span><small>${esc(u.email||u.usuario)} · #${u.id}</small></td><td>${u.cargo?title(u.cargo):'<span class="muted">Não configurado</span>'}<small>${esc(u.perfil_id)}</small></td><td>${u.vinculos.map(v=>esc(sectorName(v.setor_id))).join(', ')||'—'}</td><td>${status(u.estado)}</td><td><button data-action="user-edit" data-id="${u.id}">Gerenciar</button></td></tr>`));
++ };
++ $('#user-search').addEventListener('input',e=>{filters.search=e.target.value;update();});$('#user-role').addEventListener('change',e=>{filters.cargo=e.target.value;update();});$('#user-state').addEventListener('change',e=>{filters.estado=e.target.value;update();});update();
++}
++function renderPermissions() {
++ $('#content').innerHTML=head('Permissões','Regras por cargo e setor, com exceções individuais de três estados.','<button class="primary" data-action="permission-new">Editar permissão</button>')+
++ `<div class="notice info">As ações correspondem às permissões existentes na API. Onde o legado usa “write”, criar, editar e excluir compartilham a mesma permissão.</div><section class="panel"><div class="panel-head"><h2>Padrões por cargo e setor</h2></div>${table(['Setor','Cargo','Permissão','Regra'],state.regras.map(r=>`<tr><td>${esc(sectorName(r.setor_id))}</td><td>${title(r.cargo)}</td><td>${esc(r.permissao)}</td><td>${status(r.permitido?'ativo':'bloqueado')}</td></tr>`))}<p class="help">Ausência de regra significa acesso negado.</p></section><section class="panel"><div class="panel-head"><h2>Exceções individuais</h2></div>${table(['Usuário','Setor','Permissão','Exceção'],state.excecoes.map(r=>`<tr><td>${esc(userName(r.usuario_id))}</td><td>${esc(sectorName(r.setor_id))}</td><td>${esc(r.permissao)}</td><td>${r.permitido?'Permitido':'Negado'}</td></tr>`))}</section><section class="panel"><h2>Consultar acesso efetivo</h2><div class="form-grid">${select('effective-user','Usuário',state.usuarios.map(u=>[u.id,u.nome]))}${select('effective-sector','Setor',state.setores.map(s=>[s.id,s.nome]))}</div><button data-action="effective">Consultar permissões</button><div id="effective-result"></div></section>`;
++}
++function modal(name,html,submit) {
++ $('#modal-title').textContent=name;$('#modal-body').innerHTML=html;modalSubmit=submit;
++ if(!$('#modal').open)$('#modal').showModal();
++}
++$('#close-modal').addEventListener('click',()=>$('#modal').close());
++const approval = `<div class="confirm-block"><label>Justificativa<textarea name="justificativa" required minlength="5" maxlength="500" placeholder="Descreva o motivo desta alteração"></textarea></label><label class="confirm-label"><input name="confirmar" type="checkbox" required>Confirmo a alteração no banco compartilhado.</label></div><p class="error" id="form-error" role="alert"></p><div class="form-actions"><button type="button" data-action="cancel">Cancelar</button><button type="submit" class="primary">Confirmar e salvar</button></div>`;
++function confirmedForm(html) {return `<form id="edit-form">${html}${approval}</form>`;}
++$('#modal-body').addEventListener('submit',async event=>{
++ event.preventDefault();const form=event.target;if(form.id!=='edit-form')return;
++ const button=$('button[type=submit]',form);button.disabled=true;$('#form-error').textContent='';
++ try { const data=Object.fromEntries(new FormData(form));data.confirmar=Boolean(data.confirmar);await modalSubmit(data,form);$('#modal').close();await refresh();toast('Alteração salva e registrada no histórico.'); }
++ catch(error){$('#form-error').textContent=error.message;}finally{button.disabled=false;}
++});
++function userModal(uid=0) {
++ const u=state.usuarios.find(x=>x.id===uid)||{nome:'',usuario:'',email:'',cargo:'colaborador',perfil_id:'',estado:'pendente',vinculos:[]};
++ const row=v=>`<div class="link-row"><select name="link-sector" aria-label="Setor do vínculo" required>${options(state.setores.map(s=>[s.id,s.nome]),v.setor_id,'Setor')}</select><select name="link-role" aria-label="Cargo no setor">${options(state.cargos.map(c=>[c,title(c)]),v.cargo||u.cargo)}</select><select name="link-parent" aria-label="Responsável hierárquico">${options(state.usuarios.filter(x=>x.id!==uid).map(x=>[x.id,x.nome]),v.responsavel_id,'Sem responsável')}</select><button type="button" data-action="remove-link" aria-label="Remover vínculo">×</button></div>`;
++ modal(uid?'Gerenciar usuário':'Convidar usuário',confirmedForm(
++  `<div class="form-grid">${field('nome','Nome completo',u.nome,'text','required maxlength="120"')}${field('usuario','Identificador de login',u.usuario,'text',`required maxlength="60" ${uid?'readonly':''}`)}${field('email','E-mail',u.email,'email','maxlength="160"')}${select('perfil_id','Perfil existente no sistema',state.perfis.map(p=>[p.id,p.nome]),u.perfil_id,'Selecione um perfil')}${select('cargo','Cargo central',state.cargos.map(c=>[c,title(c)]),u.cargo)}${select('estado','Estado da conta',(uid?['ativo','bloqueado','desativado','pendente']:['pendente']).map(s=>[s,title(s)]),u.estado)}</div>`+
++  (uid?`<p class="help">Cadastrado por: ${esc(userName(u.criado_por))}${u.criado_por?'':' (origem não registrada no legado)'}. MFA: ${u.mfa?'habilitado':'não habilitado'}.</p>`:'<div class="notice info">O usuário define a própria senha por convite. A vaga fica reservada até a ativação.</div>')+
++  `<h3>Setores e responsáveis</h3><div id="link-list">${u.vinculos.map(row).join('')}</div><button type="button" data-action="add-link">Adicionar vínculo</button>`+
++  (uid?`<div class="form-actions"><button type="button" data-action="sessions" data-id="${uid}">Encerrar sessões</button><button type="button" data-action="password" data-id="${uid}">Redefinir senha por convite</button></div><p class="help">Bloqueio e desativação preservam o histórico. As alterações de acesso encerram sessões da conta.</p>`:'')),
++  async(data,form)=>{
++   data.vinculos=$$('.link-row',form).map(r=>({setor_id:Number($('[name="link-sector"]',r).value),cargo:$('[name="link-role"]',r).value,responsavel_id:Number($('[name="link-parent"]',r).value)||null}));
++   delete data['link-sector'];delete data['link-role'];delete data['link-parent'];data.email=data.email||null;
++   const result=await api('/usuarios/'+uid,'PUT',data);if(result.convite)setTimeout(()=>invitation(result.convite),20);
++  });
++ $('#link-list').dataset.row='';
++ $('#modal-body').addLink=()=>$('#link-list').insertAdjacentHTML('beforeend',row({}));
++}
++function invitation(token) {modal('Convite de definição de senha',`<div class="notice info">Este código permite definir a senha da conta e expira em 72 horas. Entregue-o somente ao usuário, por um canal privado.</div><p>Use o fluxo de convite do sistema principal ou o comando documentado no README, que chama <code>POST /auth/definir-senha</code>.</p><div class="token">${esc(token)}</div><p class="help">O código é exibido apenas nesta operação. Não aparece no histórico.</p>`);}
++function sectorModal(sid=0){
++ const s=state.setores.find(s=>s.id===sid)||{nome:'',descricao:'',ativo:true,modulos:[],cargos:[]};
++ modal(sid?'Editar setor':'Novo setor',confirmedForm(`${field('nome','Nome',s.nome,'text','required maxlength="100"')}<label>Descrição<textarea name="descricao" maxlength="500">${esc(s.descricao)}</textarea></label><div class="checklist">${check('ativo','Setor ativo',s.ativo)}</div><h3>Módulos existentes</h3><div class="checklist">${[...new Set(state.catalogo.map(k=>k.split(':')[0]))].map(m=>check('modulos',title(m),s.modulos.includes(m),m)).join('')}</div><h3>Cargos autorizados</h3><div class="checklist">${state.cargos.map(c=>check('cargos',title(c),s.cargos.includes(c),c)).join('')}</div><p class="help">Desativar o setor preserva usuários e histórico, mas nega as permissões desse contexto.</p>`),async(data,form)=>{const fd=new FormData(form);data.ativo=fd.has('ativo');data.modulos=fd.getAll('modulos');data.cargos=fd.getAll('cargos');await api('/setores/'+sid,'PUT',data);});
++}
++function limitModal(cargo='',sid=0){
++ const l=state.limites.find(l=>l.cargo===cargo&&l.setor_id===sid)||{maximo:0,habilitado:false,alerta_percentual:80,pode_cadastrar:false};
++ modal('Configurar limite',confirmedForm(`<div class="form-grid">${select('cargo','Cargo',state.cargos.map(c=>[c,title(c)]),cargo)}${select('setor_id','Contexto',[[0,'Empresa inteira'],...state.setores.map(s=>[s.id,s.nome])],sid)}${field('maximo','Máximo de usuários ativos',l.maximo,'number','required min="0" max="1000000"')}${field('alerta_percentual','Alertar ao atingir (%)',l.alerta_percentual,'number','required min="1" max="100"')}</div><div class="checklist">${check('habilitado','Liberar cadastros e reativações',l.habilitado)}${check('pode_cadastrar','Permitir delegação deste cargo (global)',l.pode_cadastrar)}</div><p class="help">Ativos e convites pendentes utilizam vagas. Reduzir o limite abaixo do uso atual bloqueia novas entradas sem desativar usuários.</p>`),async(data,form)=>{const c=data.cargo,s=Number(data.setor_id);delete data.cargo;delete data.setor_id;data.maximo=Number(data.maximo);data.alerta_percentual=Number(data.alerta_percentual);data.habilitado=new FormData(form).has('habilitado');data.pode_cadastrar=new FormData(form).has('pode_cadastrar');await api('/limites/'+c+'/'+s,'PUT',data);});
++}
++function permissionModal(){
++ modal('Editar permissão',confirmedForm(`<div class="form-grid">${select('usuario_id','Aplicar a',[[0,'Padrão do cargo'],...state.usuarios.map(u=>[u.id,u.nome])],0)}${select('setor_id','Setor',state.setores.map(s=>[s.id,s.nome]))}${select('cargo','Cargo (para regra padrão)',state.cargos.map(c=>[c,title(c)]))}${select('permissao','Permissão existente',state.catalogo.map(k=>[k,k]))}${select('estado','Regra',[['herdar','Herdar / remover personalização'],['permitido','Permitido'],['negado','Negado']])}</div><div id="permission-current" class="notice info">Selecione o contexto para consultar a regra atual.</div><p class="help">“Herdar” remove a exceção individual. No padrão do cargo, remove a regra; o acesso passa a ser negado por padrão. Exceções não concedem setores adicionais.</p>`),async(data)=>{data.usuario_id=Number(data.usuario_id)||null;data.setor_id=Number(data.setor_id);await api('/permissoes','PUT',data);});
++ const update=()=>{const f=$('#edit-form'),uid=Number($('[name=usuario_id]',f).value),sid=Number($('[name=setor_id]',f).value),cargo=$('[name=cargo]',f).value,key=$('[name=permissao]',f).value;const obj=uid?state.excecoes.find(e=>e.usuario_id===uid&&e.setor_id===sid&&e.permissao===key):state.regras.find(e=>e.cargo===cargo&&e.setor_id===sid&&e.permissao===key);$('#permission-current').textContent='Regra atual: '+(obj?(obj.permitido?'Permitido':'Negado'):'Herdar / sem regra explícita');$('[name=estado]',f).value=obj?(obj.permitido?'permitido':'negado'):'herdar';};
++ $$('#edit-form select').forEach(s=>{if(s.name!=='estado')s.addEventListener('change',update);});update();
++}
++function critical(uid,action){modal(action==='senha'?'Iniciar redefinição de senha':'Encerrar sessões',confirmedForm(`<p>Usuário: <b>${esc(userName(uid))}</b></p><div class="notice">${action==='senha'?'O acesso ficará pendente até o usuário definir a própria senha. As sessões serão revogadas.':'Encerra as sessões do painel, revoga refresh tokens e invalida tokens de acesso emitidos pelo backend integrado.'}</div>`),async(data)=>{const result=await api('/usuarios/'+uid+'/'+action,'POST',data);if(result.convite)setTimeout(()=>invitation(result.convite),20);});}
++document.addEventListener('click',async event=>{
++ const button=event.target.closest('button[data-action],button[data-page]');if(!button)return;
++ if(button.dataset.page && !button.closest('#navigation')) {currentPage=button.dataset.page;await render();return;}
++ const action=button.dataset.action;if(!action)return;const uid=Number(button.dataset.id);
++ try {
++  if(action==='cancel')$('#modal').close();
++  else if(action==='user-new')userModal();else if(action==='user-edit')userModal(uid);
++  else if(action==='sector-new')sectorModal();else if(action==='sector-edit')sectorModal(uid);
++  else if(action==='limit-new')limitModal();else if(action==='limit-edit')limitModal(button.dataset.cargo,Number(button.dataset.sid));
++  else if(action==='permission-new')permissionModal();else if(action==='add-link')$('#modal-body').addLink();else if(action==='remove-link')button.closest('.link-row').remove();
++  else if(action==='sessions')critical(uid,'sessoes');else if(action==='password')critical(uid,'senha');
++  else if(action==='audit-detail'){const log=lastHistory.find(l=>l.id===uid);modal('Detalhes da atividade',`<p>${esc(log.acao)} · ${esc(new Date(log.criado_em).toLocaleString('pt-BR'))}</p><h3>Antes</h3><pre>${esc(JSON.stringify(log.antes,null,2)||'Sem valores anteriores')}</pre><h3>Depois e justificativa</h3><pre>${esc(JSON.stringify(log.depois,null,2)||'Sem valores posteriores')}</pre>`);}
++  else if(action==='history-prev'){historyPage=Math.max(1,historyPage-1);await render();}else if(action==='history-next'){historyPage++;await render();}
++  else if(action==='effective'){const result=await api('/permissoes/'+$('[name=effective-user]').value+'/'+$('[name=effective-sector]').value);$('#effective-result').innerHTML=table(['Permissão','Acesso','Origem'],result.map(r=>`<tr><td>${esc(r.permissao)}</td><td>${r.permitido?'Permitido':'Negado'}</td><td>${esc(r.origem)}</td></tr>`));}
++ } catch(e){toast(e.message);}
++});
++(async()=>{try{await enter(await api('/session'));}catch(error){if(!error.message.includes('Entre com'))$('#login-error').textContent=error.message;}})();
+--- /dev/null
++++ b/app/central/static/favicon.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#205cf0"/><path d="M9 23V9h4l6 9V9h4v14h-4l-6-9v9z" fill="white"/></svg>
+--- /dev/null
++++ b/app/central/static/index.html
+@@ -0,0 +1,14 @@
++<!doctype html>
++<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="Controle central de usuários e acessos Nithicom"><title>Nithicom · Controle de acessos</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script></head>
++<body>
++<section id="login" class="login-shell">
++ <div class="login-brand"><div class="brandmark">N</div><span>NITHICOM</span><h1>O controle começa<br>pelo acesso.</h1><p>Administração central de usuários, equipes e permissões.</p><div class="login-detail">PAINEL PRIVADO · ACESSO LOCAL</div></div>
++ <div class="login-content"><form id="login-form"><div class="eyebrow">CENTRAL DE ACESSOS</div><h2>Entrar no painel</h2><p class="muted">Use a conta autorizada do administrador central.</p><label>Usuário<input name="usuario" autocomplete="username" required maxlength="60"></label><label>Senha<input name="senha" type="password" autocomplete="current-password" required maxlength="72"></label><button class="primary" type="submit">Entrar</button><p id="login-error" class="error" role="alert"></p><p class="login-note">As alterações são realizadas no banco compartilhado com o sistema principal.</p></form></div>
++</section>
++<div id="workspace" class="workspace" hidden>
++ <aside id="sidebar"><div class="brand"><span class="brandmark small">N</span><div>NITHICOM<small>Central de acessos</small></div></div><div class="nav-caption">ADMINISTRAÇÃO</div><nav id="navigation" aria-label="Navegação principal"></nav><div class="sidebar-foot"><span class="local-badge">LOCALHOST</span><p>Controle central<br><small>Dados do sistema principal</small></p></div></aside>
++ <div class="main"><header><button id="menu" class="icon-button" aria-label="Abrir menu">☰</button><div class="breadcrumb">Nithicom <span>/</span> <b id="breadcrumb">Visão geral</b></div><div class="account"><span class="avatar">A</span><span id="actor-name"></span><button id="logout" class="text-button">Sair</button></div></header><main id="content" tabindex="-1"></main><footer>Central de acessos Nithicom <span id="updated"></span></footer></div>
++</div>
++<dialog id="modal"><div class="dialog-head"><h2 id="modal-title"></h2><button id="close-modal" class="icon-button" aria-label="Fechar">×</button></div><div id="modal-body"></div></dialog>
++<div id="toast" class="toast" role="status" hidden></div>
++</body></html>
+--- /dev/null
++++ b/app/central/static/style.css
+@@ -0,0 +1,2 @@
++:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#182338;background:#f4f6fa;font-size:16px;--blue:#205cf0;--navy:#101c32;--muted:#657187;--border:#e1e6ef}*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:8px;padding:11px 16px;background:#edf1f8;color:#22324b;transition:background .15s}button:hover{background:#e0e7f3}button:disabled{opacity:.5;cursor:wait}.primary{background:var(--blue);color:white}.primary:hover{background:#174acc}.danger{background:#fff0ef;color:#b83232}.text-button{background:transparent;padding:6px 8px;color:var(--muted)}.icon-button{padding:5px 9px;font-size:1.3rem;background:transparent}.muted{color:var(--muted);line-height:1.6}.eyebrow,.nav-caption{font-size:.75rem;letter-spacing:.13em;font-weight:700}.eyebrow{color:var(--blue);margin-bottom:16px}h1,h2,h3,p{margin-top:0}h1{font-size:2rem;letter-spacing:-.04em;margin-bottom:10px}h2{font-size:1.45rem;letter-spacing:-.03em}h3{font-size:1rem}.brandmark{display:inline-grid;place-items:center;background:var(--blue);color:white;width:52px;height:52px;border-radius:14px;font-size:1.8rem;font-weight:800}.brandmark.small{width:38px;height:38px;border-radius:10px;font-size:1.25rem}.login-shell{min-height:100vh;display:grid;grid-template-columns:1fr 1fr}.login-brand{background:var(--navy);color:white;padding:10vh 8vw;display:flex;align-items:flex-start;flex-direction:column}.login-brand>span{font-size:.85rem;letter-spacing:.2em;margin:20px 0 80px}.login-brand h1{font-size:clamp(2.2rem,4vw,4rem);line-height:1.12;font-weight:600}.login-brand p{color:#afbed5;max-width:340px;line-height:1.8}.login-detail{margin-top:auto;font-size:.75rem;letter-spacing:.14em;color:#8093b0;border-top:1px solid #293851;padding-top:25px;width:100%}.login-content{display:grid;place-items:center;padding:40px}.login-content form{max-width:390px;width:100%}.login-content .primary{width:100%;margin-top:8px}.login-note{font-size:.875rem;color:var(--muted);line-height:1.6;border-top:1px solid var(--border);padding-top:24px;margin-top:28px}label{display:block;font-weight:600;font-size:.875rem;margin-bottom:18px}input,select,textarea{width:100%;display:block;border:1px solid #cfd7e5;border-radius:8px;padding:11px 12px;background:white;color:#182338;margin-top:7px;min-height:44px}input:focus,select:focus,textarea:focus{outline:2px solid #afc4ff;border-color:var(--blue)}input[type=checkbox]{width:18px;min-height:18px;display:inline;margin:0;accent-color:var(--blue)}textarea{min-height:90px;resize:vertical}.error{color:#b83232;line-height:1.5;font-size:.875rem;margin-top:18px}.workspace{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}[hidden]{display:none!important}aside{background:var(--navy);color:#c4cfe2;display:flex;flex-direction:column;padding:30px 18px;position:sticky;top:0;height:100vh}.brand{display:flex;align-items:center;gap:12px;color:white;font-weight:700;font-size:.9rem;letter-spacing:.1em;padding:0 8px}.brand small{display:block;color:#8398b9;letter-spacing:0;font-size:.75rem;font-weight:400;margin-top:5px}.nav-caption{color:#7890b4;margin:42px 16px 18px}nav{display:grid;gap:5px}nav button{background:transparent;color:#9eafc9;display:flex;align-items:center;gap:13px;text-align:left;padding:13px 14px;font-size:.875rem}nav button:hover{background:#1b2d49;color:white}nav button.active{background:#205cf0;color:white}.nav-icon{width:20px;display:inline-block;text-align:center;font-size:1.1rem}.sidebar-foot{margin-top:auto;padding:25px 12px 0;border-top:1px solid #263652}.local-badge{font-size:.7rem;letter-spacing:.1em;border:1px solid #405474;padding:5px 8px;border-radius:5px}.sidebar-foot p{font-size:.875rem;margin-top:17px;margin-bottom:0;line-height:1.6}.sidebar-foot small{color:#7890b4;font-size:.75rem}.main{min-width:0;display:flex;flex-direction:column}header{height:78px;background:#fff;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 38px;gap:16px}.breadcrumb{font-size:.875rem;color:var(--muted)}.breadcrumb span{margin:0 12px;color:#bac3d1}.breadcrumb b{color:#27364f;font-weight:500}.account{display:flex;align-items:center;gap:12px;font-size:.875rem}.avatar{width:32px;height:32px;display:grid;place-items:center;background:#edf2ff;color:var(--blue);border-radius:50%;font-weight:700}#menu{display:none}main{padding:38px;flex:1}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:28px}.page-head p{margin:0;font-size:.875rem;line-height:1.6;color:var(--muted)}.page-head h1{font-size:1.85rem}.subtle-badge{background:#e9efff;color:#2f60c6;border-radius:6px;padding:8px 12px;font-size:.75rem;font-weight:600}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;margin-bottom:25px}.metric{background:white;border:1px solid var(--border);border-radius:12px;padding:22px}.metric .metric-label{font-size:.875rem;color:var(--muted);margin-bottom:18px}.metric strong{display:block;font-size:2.25rem;font-weight:650;letter-spacing:-.04em}.metric small{display:block;margin-top:9px;color:var(--muted);font-size:.75rem}.metric:nth-child(2) strong{color:#168761}.metric:nth-child(3) strong{color:#c14747}.metric:nth-child(4) strong{color:#ba7c18}.grid-two{display:grid;grid-template-columns:1fr 1fr;gap:22px}.panel{background:white;border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:22px;min-width:0}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.panel-head h2{font-size:1rem;margin:0}.panel-head button{font-size:.875rem}.role-row{display:grid;grid-template-columns:110px 1fr 40px;align-items:center;gap:12px;margin:22px 0;font-size:.875rem}.progress{height:8px;border-radius:8px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:var(--blue);border-radius:8px}.bar-0{width:0}.help{font-size:.875rem;line-height:1.6;color:var(--muted);margin-bottom:0}.notice{border:1px solid #ebd8a8;background:#fff8e8;color:#8e6420;padding:16px 18px;border-radius:9px;font-size:.875rem;line-height:1.6;margin-bottom:22px}.notice.info{background:#edf3ff;color:#32578e;border-color:#cbdbf5}.empty{padding:30px;text-align:center;color:var(--muted);font-size:.875rem;line-height:1.7}.toolbar{display:flex;gap:12px;margin-bottom:20px}.toolbar input{margin:0;flex:1}.toolbar select{margin:0;width:180px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.875rem}th{font-weight:500;text-align:left;color:var(--muted);padding:13px 14px;background:#f8faff;border-bottom:1px solid var(--border);white-space:nowrap}td{padding:16px 14px;border-bottom:1px solid #edf0f6;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td small{display:block;font-size:.75rem;color:var(--muted);margin-top:5px}td button{font-size:.8rem;padding:7px 11px}td .user-cell{font-weight:600;color:#23324c}.status{display:inline-block;font-size:.75rem;padding:5px 9px;border-radius:6px;white-space:nowrap}.status.ativo{background:#e8f6ee;color:#24754a}.status.bloqueado,.status.desativado{background:#ffeded;color:#ab3c3c}.status.pendente{background:#fff4de;color:#a5741d}.status.neutral{background:#edf1f7;color:#657187}.card-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.sector-card{padding:22px;background:white;border:1px solid var(--border);border-radius:12px}.sector-card h2{font-size:1.1rem;margin:18px 0 9px}.sector-card p{font-size:.875rem;color:var(--muted);min-height:40px;line-height:1.6}.tags{display:flex;flex-wrap:wrap;gap:7px;margin:16px 0}.tag{font-size:.75rem;background:#f0f3f8;border-radius:5px;padding:5px 7px;color:#637187}.sector-card button{width:100%;font-size:.875rem}.hierarchy-row{margin:10px 0;border-left:3px solid #dbe5fb;padding:14px 18px;background:#f8faff;display:flex;justify-content:space-between;gap:15px;border-radius:0 8px 8px 0}.hierarchy-row strong{font-size:.875rem}.hierarchy-row small{color:var(--muted);font-size:.8rem;display:block;margin-top:7px}.level-1{margin-left:20px}.level-2{margin-left:40px}.level-3{margin-left:60px}footer{padding:20px 38px;color:#8a95a8;font-size:.75rem;display:flex;justify-content:space-between;border-top:1px solid var(--border)}dialog{border:0;border-radius:14px;padding:0;max-width:780px;width:calc(100% - 32px);box-shadow:0 25px 90px #0d1f3c44;max-height:90vh}dialog::backdrop{background:#0b173e88;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;justify-content:space-between;padding:22px 26px;border-bottom:1px solid var(--border);position:sticky;top:0;background:white;z-index:1}.dialog-head h2{font-size:1.25rem;margin:0}#modal-body{padding:26px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}.full{grid-column:1/-1}.checklist{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px}.checklist label,.confirm-label{display:flex;align-items:center;gap:9px;font-weight:400;margin:0}.checklist label{background:#f4f7fc;padding:10px;border-radius:7px}.confirm-block{border-top:1px solid var(--border);padding-top:20px;margin-top:25px}.form-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.link-row{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}.link-row select{font-size:.8rem}.link-row button{margin-top:6px}.toast{position:fixed;bottom:25px;right:25px;background:#15243e;color:white;border-radius:10px;padding:16px 22px;box-shadow:0 6px 30px #0002;max-width:400px;font-size:.875rem;z-index:10;line-height:1.6}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.8rem;background:#f4f6fa;padding:18px;border-radius:8px;line-height:1.6}.token{font-family:monospace;overflow-wrap:anywhere;background:#edf3ff;padding:18px;border-radius:8px;user-select:all}.pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-top:20px;font-size:.875rem}.settings-row{display:flex;justify-content:space-between;padding:18px 0;border-bottom:1px solid var(--border);font-size:.875rem}.settings-row:last-child{border:0}.scope-note{margin-top:12px;font-size:.75rem;color:#8e6420}.loading{padding:50px;color:var(--muted)}@media(max-width:1200px){.workspace{grid-template-columns:225px minmax(0,1fr)}main{padding:28px}.metrics{gap:12px}.metric{padding:18px}.card-grid{grid-template-columns:repeat(2,1fr)}header{padding:0 28px}}@media(max-width:950px){.metrics{grid-template-columns:repeat(2,1fr)}.grid-two{grid-template-columns:1fr}.workspace{grid-template-columns:1fr}aside{position:fixed;left:-270px;width:252px;z-index:5;transition:left .2s}aside.open{left:0;box-shadow:15px 0 40px #0004}#menu{display:block}header{height:70px}.breadcrumb{flex:1}.account #actor-name{display:none}}@media(max-width:620px){.login-shell{grid-template-columns:1fr}.login-brand{padding:30px}.login-brand h1,.login-brand p,.login-detail{display:none}.login-brand>span{margin:15px 0 0}.login-content{padding:35px 24px}.page-head{align-items:flex-start;flex-direction:column;gap:12px}main{padding:24px 16px}.metrics{gap:10px}.metric{padding:16px}.metric strong{font-size:1.8rem}.card-grid,.form-grid{grid-template-columns:1fr}.toolbar{flex-wrap:wrap}.toolbar input{flex-basis:100%}.toolbar select{flex:1;width:100px}.panel{padding:18px}.link-row{grid-template-columns:1fr 1fr}.hierarchy-row{margin-left:0}.breadcrumb{font-size:.75rem}.breadcrumb span{margin:0 5px}header{padding:0 12px}.account{gap:5px}footer{padding:20px 16px;gap:12px;flex-wrap:wrap}.settings-row{gap:20px}#modal-body{padding:20px}.dialog-head{padding:18px 20px}}
++:root progress{width:100%;height:8px;border:0;border-radius:6px;overflow:hidden;background:#edf1f8;appearance:none}progress::-webkit-progress-bar{background:#edf1f8}progress::-webkit-progress-value{background:#205cf0;border-radius:6px}progress::-moz-progress-bar{background:#205cf0;border-radius:6px}

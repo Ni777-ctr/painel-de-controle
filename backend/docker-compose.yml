@@ -1,0 +1,18 @@
+# PostgreSQL de DESENVOLVIMENTO local. Credenciais fracas propositalmente
+# simples (uso local apenas) -- nunca use isto em produção.
+# Uso: docker compose up -d db
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eletrogestor
+      POSTGRES_PASSWORD: eletrogestor
+      POSTGRES_DB: eletrogestor
+    ports:
+      - "5432:5432"
+    volumes:
+      - eletrogestor_pgdata:/var/lib/postgresql/data
+
+volumes:
+  eletrogestor_pgdata:

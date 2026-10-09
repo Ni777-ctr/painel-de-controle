@@ -1,0 +1,21 @@
+{
+  "originais": {
+    "app/config.py": "b8eff8cb9f214316a2c79949e1fbd6df264f0193089ef8412fb0daca58ac1c15",
+    "app/deps.py": "e94d4acaaf5fde2b28e7c1a1a74d8ea49a43208b02ff3d79d5dd5c1b4ec25a14",
+    "app/main.py": "90fa40601a7d01677150ae6b6602e244c791fbae7d827476fd56a65334ec5c79",
+    "app/routers/auth.py": "4eeb0a1e28917e6905f5780ebaf143d6c3a3a51bf9538060aa45df0256d88cbe",
+    "scripts/anonimizar_homologacao.py": "50a8f8dcae657c5295f1591774002986e03e7e3bcdcb1d4c4a830897a55bd316"
+  },
+  "novos": [
+    "alembic/versions/0011_central_local.py",
+    "app/central/__init__.py",
+    "app/central/delegacao.py",
+    "app/central/main.py",
+    "app/central/models.py",
+    "app/central/policy.py",
+    "app/central/static/app.js",
+    "app/central/static/favicon.svg",
+    "app/central/static/index.html",
+    "app/central/static/style.css"
+  ]
+}

@@ -1,0 +1,66 @@
+# Blueprint do Render: API (Docker) + cron de notificacoes.
+# Banco: Neon (Postgres gerenciado) -- cole a connection string em DATABASE_URL
+# no painel do Render (nao commite). Veja docs/PUBLICACAO.md.
+services:
+  - type: web
+    name: eletrogestor-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /saude/pronto
+    preDeployCommand: alembic upgrade head
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false            # string do Neon, com ?sslmode=require
+      - key: JWT_SECRET_KEY
+        generateValue: true    # o Render gera um valor aleatorio forte
+      - key: CORS_ORIGINS
+        sync: false            # ex.: https://app.seudominio.com.br
+      - key: FRONTEND_URL
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false            # ex.: api.seudominio.com.br
+      - key: TRUST_PROXY
+        value: "true"
+      - key: FORCE_HTTPS
+        value: "true"
+      - key: DOCS_HABILITADO
+        value: "false"
+      - key: MFA_OBRIGATORIO_ENFORCE
+        value: "true"
+      - key: LOG_JSON
+        value: "true"
+      - key: SENTRY_DSN
+        sync: false
+      - key: EMAIL_HABILITADO
+        value: "true"
+      - key: SMTP_HOST
+        value: smtp.resend.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USUARIO
+        value: resend
+      - key: SMTP_SENHA
+        sync: false            # API key do Resend
+      - key: EMAIL_REMETENTE
+        sync: false            # ex.: EletroGestor <avisos@seudominio.com.br> (dominio verificado no Resend)
+
+  - type: cron
+    name: eletrogestor-notificacoes
+    runtime: docker
+    schedule: "0 * * * *"      # de hora em hora (UTC)
+    dockerCommand: python -m app.jobs.processar_notificacoes
+    envVars:
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: DATABASE_URL }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: JWT_SECRET_KEY }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: FRONTEND_URL }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: ENVIRONMENT }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: CORS_ORIGINS }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: EMAIL_HABILITADO }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: SMTP_HOST }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: SMTP_PORT }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: SMTP_USUARIO }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: SMTP_SENHA }
+      - fromService: { type: web, name: eletrogestor-api, envVarKey: EMAIL_REMETENTE }

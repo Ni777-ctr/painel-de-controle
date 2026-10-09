@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="Controle central de usuários e acessos Nithicom"><title>Nithicom · Controle de acessos</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script></head>
+<body>
+<section id="login" class="login-shell">
+ <div class="login-brand"><div class="brandmark">N</div><span>NITHICOM</span><h1>O controle começa<br>pelo acesso.</h1><p>Administração central de usuários, equipes e permissões.</p><div class="login-detail">PAINEL PRIVADO · ACESSO LOCAL</div></div>
+ <div class="login-content"><form id="login-form"><div class="eyebrow">CENTRAL DE ACESSOS</div><h2>Entrar no painel</h2><p class="muted">Use a conta autorizada do administrador central.</p><label>Usuário<input name="usuario" autocomplete="username" required maxlength="60"></label><label>Senha<input name="senha" type="password" autocomplete="current-password" required maxlength="72"></label><button class="primary" type="submit">Entrar</button><p id="login-error" class="error" role="alert"></p><p class="login-note">As alterações são realizadas no banco compartilhado com o sistema principal.</p></form></div>
+</section>
+<div id="workspace" class="workspace" hidden>
+ <aside id="sidebar"><div class="brand"><span class="brandmark small">N</span><div>NITHICOM<small>Central de acessos</small></div></div><div class="nav-caption">ADMINISTRAÇÃO</div><nav id="navigation" aria-label="Navegação principal"></nav><div class="sidebar-foot"><span class="local-badge">LOCALHOST</span><p>Controle central<br><small>Dados do sistema principal</small></p></div></aside>
+ <div class="main"><header><button id="menu" class="icon-button" aria-label="Abrir menu">☰</button><div class="breadcrumb">Nithicom <span>/</span> <b id="breadcrumb">Visão geral</b></div><div class="account"><span class="avatar">A</span><span id="actor-name"></span><button id="logout" class="text-button">Sair</button></div></header><main id="content" tabindex="-1"></main><footer>Central de acessos Nithicom <span id="updated"></span></footer></div>
+</div>
+<dialog id="modal"><div class="dialog-head"><h2 id="modal-title"></h2><button id="close-modal" class="icon-button" aria-label="Fechar">×</button></div><div id="modal-body"></div></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+</body></html>

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     DOCS_HABILITADO: bool = True
     # IDs autorizados ao painel local; não altera os hosts/CORS do site principal.
     CENTRAL_ADMIN_IDS: str = ''
+    CENTRAL_LOGIN_USER_ID: int = 0
+    CENTRAL_PASSWORD_HASH: str = ''
     # Exige 2FA para os perfis em PERFIS_COM_2FA_OBRIGATORIO (app/security.py).
     MFA_OBRIGATORIO_ENFORCE: bool = False
     # Limite de tentativas de login por IP (janela deslizante, em memoria do processo).

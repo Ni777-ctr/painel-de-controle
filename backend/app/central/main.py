@@ -92,6 +92,22 @@ def finish_login(result, response, db):
 
 @app.post('/api/login')
 def login(data: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    from app.config import get_settings
+    from app.security import limitador_login, verificar_senha
+    settings = get_settings()
+    if settings.CENTRAL_PASSWORD_HASH:
+        # Credencial exclusiva deste painel; nunca altera senha_hash em usuarios.
+        if limitador_login.excedeu('central-exclusive-login', 5, 60):
+            raise HTTPException(429, 'Muitas tentativas. Aguarde um minuto.')
+        user = db.get(Usuario, settings.CENTRAL_LOGIN_USER_ID)
+        password_ok = verificar_senha(data.senha, settings.CENTRAL_PASSWORD_HASH)
+        if not user or not central_admin(user) or data.usuario != user.usuario or not password_ok:
+            deny(db, None, 'Usuário ou senha inválidos para a central.')
+        if user.bloqueado_ate and aware(user.bloqueado_ate) > datetime.now(timezone.utc):
+            raise HTTPException(423, 'Conta de administrador bloqueada.')
+        audit(db, user, 'login_exclusivo', 'usuarios', user.id, {}, {}, 'Credencial exclusiva do painel central.')
+        result = auth._finalizar_login(db, user, datetime.now(timezone.utc), 'central_login_sucesso')
+        return finish_login(result, response, db)
     user = db.query(Usuario).filter_by(usuario=data.usuario).first()
     # Previne que contas comuns obtenham tokens temporários administrativos.
     if not user or not central_admin(user):
